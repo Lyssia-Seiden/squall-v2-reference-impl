@@ -9,7 +9,10 @@ pub fn main(init: std.process.Init) !void {
         .stackBase = 0x7FFFFFFF,
         .stackTop = 0x7FFFFFFF,
     };
-    state.push(.{ .tag = .{ .ip = 0, .fp = 0xFF, .port = .Left }, .acc = 1 });
+    state.push(.{
+        .tag = .init(0, try squall_v2.FramePtr.parse(0xFE), .Left),
+        .acc = 1,
+    });
     std.debug.print("{}\n", .{state});
     squall_v2.clock(&state);
     std.debug.print("{}\n", .{state});

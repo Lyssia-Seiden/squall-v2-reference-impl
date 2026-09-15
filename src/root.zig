@@ -1,22 +1,50 @@
 const std = @import("std");
 const Io = std.Io;
 
-const SqPtr = u40;
+const SqPtr = u32;
 const Port = enum(u1) { Left, Right };
-const Tag = packed struct(u81) {
-    ip: SqPtr,
-    fp: SqPtr,
-    port: Port,
+pub const FramePtr = packed struct(u31) {
+    repr: u31,
+
+    pub const Error = error{Misaligned};
+
+    pub fn parse(ptr: SqPtr) Error!FramePtr {
+        if (ptr & 1 != 0) return Error.Misaligned;
+        return .{ .repr = @intCast(ptr >> 1) };
+    }
+
+    pub fn addr(self: FramePtr) SqPtr {
+        return @as(SqPtr, self.repr) << 1;
+    }
 };
-const Token = packed struct(u256) {
+
+pub const Tag = packed struct(u64) {
+    ip: SqPtr,
+    fp: FramePtr,
+    port: Port,
+
+    pub fn init(ip: SqPtr, fp: FramePtr, port: Port) Tag {
+        return .{ .ip = ip, .fp = fp, .port = port };
+    }
+
+    pub fn offsetWith(self: Tag, dest: Dest) Tag {
+        return .{
+            .ip = @intCast(dest.offset + @as(PtrArith, self.ip)),
+            .fp = self.fp,
+            .port = dest.port,
+        };
+    }
+};
+const Word = u64; // accumulator / memory word
+/// Wide enough to hold any SqPtr plus a signed instruction offset without wrapping.
+const PtrArith = i34;
+const Token = packed struct(u128) {
     tag: Tag,
-    acc: u128,
-    // we should use this for something!
-    pad: u47 = 0,
+    acc: Word,
 };
 
 const PresenceBits = enum(u2) { Empty, Present, Constant };
-const MemValue = packed struct(u128) { pb: PresenceBits, val: u126 };
+const MemValue = packed struct(u64) { pb: PresenceBits, val: u62 };
 
 const Dest = packed struct { offset: i20, port: Port };
 const AluOp = enum(u5) { nop, add, sub, and_, or_, xor, not, mul, div, shl, shrl, shra };
@@ -79,8 +107,8 @@ pub fn clock(state: *State) void {
 fn clock_token(state: *State, token: Token) void {
     const instr: Instr = @bitCast(state.read(Instr, token.tag.ip));
     const effective_address: SqPtr = switch (instr.addr_tag) {
-        .FrameRelative => @intCast(@as(i41, token.tag.fp) + @as(SqPtr, @intCast(instr.addr.unsigned))),
-        .CodeRelative => @intCast(@as(i41, token.tag.ip) + instr.addr.signed),
+        .FrameRelative => @intCast(@as(PtrArith, token.tag.fp.addr()) + @as(PtrArith, instr.addr.unsigned)),
+        .CodeRelative => @intCast(@as(PtrArith, token.tag.ip) + instr.addr.signed),
         .Absolute => instr.addr.unsigned,
     };
 
@@ -108,9 +136,9 @@ fn clock_token(state: *State, token: Token) void {
             else
                 .Present;
         state.write(
-            u128,
+            MemValue,
             effective_address,
-            (@as(u128, @intFromEnum(new_pb)) << 126) | @as(u126, @truncate(token.acc)),
+            .{ .pb = new_pb, .val = @truncate(token.acc) },
         );
         return; // and wait for our other token to join :D
     } else if (other.pb == .Present) {
@@ -120,13 +148,13 @@ fn clock_token(state: *State, token: Token) void {
             else
                 .Empty;
         state.write(
-            u128,
+            MemValue,
             effective_address,
-            (@as(u128, @intFromEnum(new_pb)) << 126) | @as(u126, @truncate(token.acc)),
+            .{ .pb = new_pb, .val = @truncate(token.acc) },
         );
     }
 
-    const other_acc: u126 = other.val; // gangalang what are our signedness semantics
+    const other_acc: Word = other.val; // gangalang what are our signedness semantics
     const maybe_res_l, const maybe_res_r = apply_alu(
         instr.alu_op,
         if (token.tag.port == .Left) token.acc else other_acc,
@@ -143,65 +171,34 @@ fn clock_token(state: *State, token: Token) void {
     if (maybe_token_r) |t| state.push(t);
 }
 
-fn apply_alu(op: AluOp, val_l: u128, val_r: u128) struct { ?u128, ?u128 } {
+fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
     return switch (op) {
         .nop => .{ val_l, val_r },
         .add => {
             const res, const ov = @addWithOverflow(val_l, val_r);
             return .{ res, ov };
         },
-        else => unreachable(), // todo
+        else => unreachable, // todo
     };
 }
 
-fn form_tokens(from: Token, instr: Instr, val_l: ?u128, val_r: ?u128) struct { ?Token, ?Token } {
+fn form_tokens(from: Token, instr: Instr, val_l: ?Word, val_r: ?Word) struct { ?Token, ?Token } {
     var res: struct { ?Token, ?Token } = .{ null, null };
     switch (instr.token_forming_rule) {
         .Arith => {
             if (val_l) |v| {
-                res.@"0" = Token{
-                    .tag = .{
-                        .ip = @intCast(instr.d1.offset + @as(i41, @intCast(from.tag.ip))),
-                        .fp = from.tag.fp,
-                        .port = instr.d1.port,
-                    },
-                    .acc = v,
-                };
+                res.@"0" = Token{ .tag = from.tag.offsetWith(instr.d1), .acc = v };
             }
             if (val_r) |v| {
-                res.@"1" = Token{
-                    .tag = .{
-                        .ip = @intCast(instr.d2.offset + @as(i41, @intCast(from.tag.ip))),
-                        .fp = from.tag.fp,
-                        .port = instr.d2.port,
-                    },
-                    .acc = v,
-                };
+                res.@"1" = Token{ .tag = from.tag.offsetWith(instr.d2), .acc = v };
             }
             return res;
         },
         .Switch => {
             if (val_r) |condition| {
                 if (val_l) |v| {
-                    if (condition != 0) {
-                        res.@"0" = Token{
-                            .tag = .{
-                                .ip = @intCast(instr.d2.offset + @as(i41, @intCast(from.tag.ip))),
-                                .fp = from.tag.fp,
-                                .port = instr.d2.port,
-                            },
-                            .acc = v,
-                        };
-                    } else {
-                        res.@"1" = Token{
-                            .tag = .{
-                                .ip = @intCast(instr.d2.offset + @as(i41, @intCast(from.tag.ip))),
-                                .fp = from.tag.fp,
-                                .port = instr.d2.port,
-                            },
-                            .acc = v,
-                        };
-                    }
+                    const taken = Token{ .tag = from.tag.offsetWith(instr.d2), .acc = v };
+                    if (condition != 0) res.@"0" = taken else res.@"1" = taken;
                 }
             }
             // empty when one of these is missing; should never happen
@@ -210,15 +207,8 @@ fn form_tokens(from: Token, instr: Instr, val_l: ?u128, val_r: ?u128) struct { ?
         .Send => {
             if (val_l) |tag| {
                 if (val_r) |v| {
-                    res.@"0" = .{ .tag = @bitCast(@as(u81, @truncate(tag))), .acc = v };
-                    res.@"1" = Token{
-                        .tag = .{
-                            .ip = @intCast(instr.d1.offset + @as(i41, @intCast(from.tag.ip))),
-                            .fp = from.tag.fp,
-                            .port = instr.d1.port,
-                        },
-                        .acc = v,
-                    };
+                    res.@"0" = .{ .tag = @bitCast(tag), .acc = v };
+                    res.@"1" = Token{ .tag = from.tag.offsetWith(instr.d1), .acc = v };
                 }
             }
             // as before, we should always have both values for this
@@ -226,16 +216,8 @@ fn form_tokens(from: Token, instr: Instr, val_l: ?u128, val_r: ?u128) struct { ?
         },
         .Extract => {
             res.@"0" = Token{
-                .tag = .{
-                    .ip = @intCast(instr.d1.offset + @as(i41, @intCast(from.tag.ip))),
-                    .fp = from.tag.fp,
-                    .port = instr.d1.port,
-                },
-                .acc = @intCast(@as(u81, @bitCast(Tag{
-                    .ip = @intCast(instr.d2.offset + @as(i41, @intCast(from.tag.ip))),
-                    .fp = from.tag.fp,
-                    .port = instr.d2.port,
-                }))),
+                .tag = from.tag.offsetWith(instr.d1),
+                .acc = @as(Word, @bitCast(from.tag.offsetWith(instr.d2))),
             };
             return res;
         },
