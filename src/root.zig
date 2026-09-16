@@ -1,54 +1,60 @@
 const std = @import("std");
 const Io = std.Io;
 
-const SqPtr = u32;
-const Port = enum(u1) { Left, Right };
-pub const FramePtr = packed struct(u31) {
-    repr: u31,
+pub const SqPtr = u32;
+pub const Port = enum(u1) { Left, Right };
 
-    pub const Error = error{Misaligned};
+pub fn AlignedSqPtr(a: comptime_int) type {
+    return packed struct(u29) {
+        repr: @Int(.unsigned, @typeInfo(SqPtr).int.bits - a),
 
-    pub fn parse(ptr: SqPtr) Error!FramePtr {
-        if (ptr & 1 != 0) return Error.Misaligned;
-        return .{ .repr = @intCast(ptr >> 1) };
-    }
+        pub const Error = error{Misaligned};
 
-    pub fn addr(self: FramePtr) SqPtr {
-        return @as(SqPtr, self.repr) << 1;
-    }
-};
+        pub fn parse(ptr: SqPtr) Error!AlignedSqPtr(a) {
+            if (ptr & ((2 << a) - 1) != 0) return Error.Misaligned;
+            return .{ .repr = @intCast(ptr >> a) };
+        }
 
-pub const Tag = packed struct(u64) {
+        pub fn addr(self: AlignedSqPtr(a)) SqPtr {
+            return @as(SqPtr, self.repr) << a;
+        }
+    };
+}
+
+/// Small enough to fit in the non-pb part of a word
+pub const Tag = packed struct(u62) {
     ip: SqPtr,
-    fp: FramePtr,
+    fp: AlignedSqPtr(3),
     port: Port,
 
-    pub fn init(ip: SqPtr, fp: FramePtr, port: Port) Tag {
+    pub fn init(ip: SqPtr, fp: AlignedSqPtr(3), port: Port) Tag {
         return .{ .ip = ip, .fp = fp, .port = port };
     }
 
     pub fn offsetWith(self: Tag, dest: Dest) Tag {
         return .{
-            .ip = @intCast(dest.offset + @as(PtrArith, self.ip)),
+            .ip = @intCast(@as(PtrArith, dest.offset) +% @as(PtrArith, self.ip)),
             .fp = self.fp,
             .port = dest.port,
         };
     }
 };
-const Word = u64; // accumulator / memory word
+pub const Word = u64; // accumulator / memory word
+pub const EffWord = u62; // alu / non-pb word
 /// Wide enough to hold any SqPtr plus a signed instruction offset without wrapping.
-const PtrArith = i34;
-const Token = packed struct(u128) {
+pub const PtrArith = i34;
+pub const Token = packed struct(u128) {
+    pad: u2 = 0,
     tag: Tag,
     acc: Word,
 };
 
-const PresenceBits = enum(u2) { Empty, Present, Constant };
-const MemValue = packed struct(u64) { pb: PresenceBits, val: u62 };
+pub const PresenceBits = enum(u2) { Empty, Present, Constant };
+pub const MemValue = packed struct(u64) { pb: PresenceBits, val: u62 };
 
-const Dest = packed struct { offset: i20, port: Port };
-const AluOp = enum(u5) { nop, add, sub, and_, or_, xor, not, mul, div, shl, shrl, shra };
-const Instr = packed struct(u64) {
+pub const Dest = packed struct { offset: i20, port: Port };
+pub const AluOp = enum(u5) { nop, add, sub, and_, or_, xor, not, mul, div, shl, shrl, shra, rev };
+pub const Instr = packed struct(u64) {
     addr: packed union(u11) {
         signed: i11,
         unsigned: u11,
@@ -101,6 +107,9 @@ pub const State = struct {
 
 pub fn clock(state: *State) void {
     const token = if (state.pop()) |t| t else return;
+    // Absolute(0) address is a dump
+    std.debug.print("{}\n", .{token});
+    if (token.tag.ip == 0x00) return;
     clock_token(state, token);
 }
 
@@ -207,7 +216,13 @@ fn form_tokens(from: Token, instr: Instr, val_l: ?Word, val_r: ?Word) struct { ?
         .Send => {
             if (val_l) |tag| {
                 if (val_r) |v| {
-                    res.@"0" = .{ .tag = @bitCast(tag), .acc = v };
+                    res.@"0" = .{
+                        .tag = @bitCast(@as(
+                            @typeInfo(Tag).@"struct".backing_integer orelse unreachable(),
+                            @truncate(tag),
+                        )),
+                        .acc = v,
+                    };
                     res.@"1" = Token{ .tag = from.tag.offsetWith(instr.d1), .acc = v };
                 }
             }
@@ -217,7 +232,7 @@ fn form_tokens(from: Token, instr: Instr, val_l: ?Word, val_r: ?Word) struct { ?
         .Extract => {
             res.@"0" = Token{
                 .tag = from.tag.offsetWith(instr.d1),
-                .acc = @as(Word, @bitCast(from.tag.offsetWith(instr.d2))),
+                .acc = @as(EffWord, @bitCast(from.tag.offsetWith(instr.d2))),
             };
             return res;
         },
