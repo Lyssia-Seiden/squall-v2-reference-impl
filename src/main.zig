@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
         .stackTop = 0x7FFFFFFF,
     };
     state.push(.{
-        .tag = .init(8, try squall_v2.AlignedSqPtr(3).parse(0xF0), .Left),
+        .tag = .init(try .parse(8), try squall_v2.AlignedSqPtr(3).parse(0xF0), .Left),
         .acc = 1,
     });
     state.write(squall_v2.Instr, 8, .{
