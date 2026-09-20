@@ -83,7 +83,7 @@ pub const Token = packed struct(u128) {
 };
 
 pub const PresenceBits = enum(u2) { Empty, Present, Constant };
-pub const MemValue = packed struct(u64) { pb: PresenceBits, val: u62 };
+pub const MemValue = packed struct(u64) { val: u62, pb: PresenceBits };
 
 /// offset is in instructions, not bytes
 pub const Dest = packed struct { offset: i20, port: Port };
@@ -103,8 +103,12 @@ pub const AluOp = enum(u6) {
     // unary
     Not,
     Rev,
+    Dupl,
+    Dupr,
     // switch - two operands, one of two outputs
     Beqz,
+    Beql,
+    Beqr,
 };
 pub const MonadicInstr = packed struct(u62) {
     alu_op: AluOp,
@@ -324,15 +328,25 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
         },
         .Shl => .{ val_l << @truncate(val_r), null },
         .Shrl => .{ val_l >> @truncate(val_r), null },
-        .Shra => .{ @as(Word, @bitCast(@as(SignedWord, @bitCast(val_l)))) >> @truncate(val_r), null },
+        .Shra => .{ @as(Word, @bitCast(@as(SignedWord, @bitCast(val_l)) >> @truncate(val_r))), null },
         .And => .{ val_l & val_r, null },
         .Or => .{ val_l | val_r, null },
         .Xor => .{ val_l ^ val_r, null },
         .Not => .{ ~val_l, ~val_r },
         .Rev => .{ @bitReverse(val_l), @bitReverse(val_r) },
+        .Dupl => .{ val_l, val_l },
+        .Dupr => .{ val_r, val_r },
         .Beqz => .{
             if (val_l != 0) val_r else null,
             if (val_l == 0) val_r else null,
+        },
+        .Beql => .{
+            if (val_l != val_r) val_l else null,
+            if (val_l == val_r) val_l else null,
+        },
+        .Beqr => .{
+            if (val_l != val_r) val_r else null,
+            if (val_l == val_r) val_r else null,
         },
     };
 }
