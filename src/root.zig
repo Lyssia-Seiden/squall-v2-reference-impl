@@ -60,10 +60,13 @@ pub const Tag = packed struct(u62) {
     }
 };
 pub const Word = u64; // accumulator / memory word
+pub const SignedWord = i64; // accumulator / memory word
 pub const EffWord = u62; // alu / non-pb word
 
-pub fn extendImm(imm: i32) Word {
-    return @bitCast(@as(@Int(.signed, @typeInfo(Word).int.bits), imm));
+pub fn signExtend(val: anytype) Word {
+    const ty = @typeInfo(@TypeOf(val));
+    const signed = @as(@Int(.signed, ty.int.bits), if (ty.int.signedness == .unsigned) @bitCast(val) else val);
+    return @bitCast(@as(@Int(.signed, @typeInfo(Word).int.bits), signed));
 }
 
 pub const Token = packed struct(u128) {
@@ -188,8 +191,8 @@ fn clock_token(state: *State, token: Token) void {
             const data = instr.data.monadic;
             const maybe_l, const maybe_r = apply_alu(
                 data.alu_op,
-                if (token.tag.port == .Left) token.acc else extendImm(data.imm),
-                if (token.tag.port == .Right) token.acc else extendImm(data.imm),
+                if (token.tag.port == .Left) token.acc else signExtend(data.imm),
+                if (token.tag.port == .Right) token.acc else signExtend(data.imm),
             );
             if (maybe_l) |l| {
                 state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = l });
@@ -241,7 +244,7 @@ fn clock_token(state: *State, token: Token) void {
                 }
             }
 
-            const other_acc: Word = other.val;
+            const other_acc: Word = signExtend(other.val);
             const maybe_l, const maybe_r = apply_alu(
                 switch (data.forming_rule_tag) {
                     .Arith => data.forming_rule_payload.arith.alu_op,
@@ -270,7 +273,7 @@ fn clock_token(state: *State, token: Token) void {
                                 .acc = v,
                             });
                             state.push(.{
-                                .tag = token.tag.offsetWith(data.dyadic.d),
+                                .tag = token.tag.offsetWith(data.d),
                                 .acc = v,
                             });
                         }
@@ -299,7 +302,30 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
             const res, const ov = @addWithOverflow(val_l, val_r);
             return .{ res, ov };
         },
+        .Sub => {
+            const res, const ov = @subWithOverflow(val_l, val_r);
+            return .{ res, ov };
+        },
+        .Mul => {
+            const res = @as(u128, val_l) * @as(u128, val_r);
+            return .{ @truncate(res), @truncate(res >> 64) };
+        },
+        .Div => {
+            const res = @divTrunc(val_l, val_r);
+            // todo make second token 0, nonexact codes
+            return .{ res, null };
+        },
         .Shl => .{ val_l << @truncate(val_r), null },
-        else => unreachable, // todo
+        .Shrl => .{ val_l >> @truncate(val_r), null },
+        .Shra => .{ @as(Word, @bitCast(@as(SignedWord, @bitCast(val_l)))) >> @truncate(val_r), null },
+        .And => .{ val_l & val_r, null },
+        .Or => .{ val_l | val_r, null },
+        .Xor => .{ val_l ^ val_r, null },
+        .Not => .{ ~val_l, ~val_r },
+        .Rev => .{ @bitReverse(val_l), @bitReverse(val_r) },
+        .Beqz => .{
+            if (val_l != 0) val_r else null,
+            if (val_l == 0) val_r else null,
+        },
     };
 }
