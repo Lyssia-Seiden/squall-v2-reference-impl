@@ -1,6 +1,12 @@
 const std = @import("std");
 const Io = std.Io;
 
+pub const assembler = @import("assembler.zig");
+
+test {
+    _ = assembler;
+}
+
 pub const SqPtr = u32;
 pub const Port = enum(u1) { Left, Right };
 
@@ -35,7 +41,8 @@ pub fn AlignedSqPtr(a: comptime_int) type {
 
 test "sqptr align" {
     for (0..64) |i| {
-        std.testing.expectEqual(i % 4 == 0, AlignedSqPtr(2).parse(i) != .Misaligned);
+        const aligned = if (AlignedSqPtr(2).parse(@intCast(i))) |_| true else |_| false;
+        try std.testing.expectEqual(i % 4 == 0, aligned);
     }
 }
 
