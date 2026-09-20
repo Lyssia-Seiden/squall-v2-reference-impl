@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
         .label = "double",
         .value = .{ .monadic = .{
             .d = .{ .node = .{ .label = "plus1", .port = .Left } },
-            .op = .Shl,
+            .op = .Mul,
             .imm = 2,
             .second = null,
         } },
@@ -27,12 +27,12 @@ pub fn main(init: std.process.Init) !void {
 
     var state = try a.create_image(
         init.arena.allocator(),
-        instrs,
+        instrs.items,
         &.{},
         0x7FFFFF,
     );
     state.push(.{
-        .tag = .init(try .parse(0x8), try squall_v2.AlignedSqPtr(3).parse(0xF0), .Left),
+        .tag = .init(try .parse(0x10), try squall_v2.AlignedSqPtr(3).parse(0xF0), .Left),
         .acc = 1,
     });
     std.debug.print("{}\n", .{state});

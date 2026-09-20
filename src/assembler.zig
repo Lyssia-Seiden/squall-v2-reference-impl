@@ -133,10 +133,11 @@ pub const AsmField = union(enum) {
     write: Write,
     value: sq.MemValue,
 };
-pub const SqAsm = std.ArrayList(struct {
+pub const Entry = struct {
     label: Label,
     value: AsmField,
-});
+};
+pub const SqAsm = std.ArrayList(Entry);
 
 fn value_to_word(
     f: AsmField,
@@ -184,9 +185,28 @@ fn value_to_word(
     };
 }
 
+pub const image_base: sq.SqPtr = 0x10;
+
+fn entryAddr(index: usize) sq.SqPtr {
+    return image_base + @as(sq.SqPtr, @intCast(index * @sizeOf(sq.Word)));
+}
+
+/// Addresses are fixed by position, so a full map is available before any
+/// entry is encoded and forward references resolve like backward ones.
+fn resolveLabels(allocator: std.mem.Allocator, entries: []const Entry) !LabelLookup {
+    var labelLookup: LabelLookup = .init(allocator);
+    errdefer labelLookup.deinit();
+    for (entries, 0..) |entry, i| {
+        const slot = try labelLookup.getOrPut(entry.label);
+        if (slot.found_existing) return error.DuplicateLabel;
+        slot.value_ptr.* = entryAddr(i);
+    }
+    return labelLookup;
+}
+
 pub fn create_image(
     allocator: std.mem.Allocator,
-    sqAsm: SqAsm,
+    entries: []const Entry,
     tokens: []const sq.Token,
     stackBase: sq.SqPtr,
 ) !sq.State {
@@ -195,23 +215,52 @@ pub fn create_image(
         .stackBase = stackBase,
         .stackTop = stackBase,
     };
-    var writePtr: sq.SqPtr = 0x10;
-    var labelLookup: LabelLookup = .init(allocator);
-    for (sqAsm.items) |v| {
-        try labelLookup.put(v.label, writePtr);
-        state.write(
-            sq.Word,
-            writePtr,
-            try value_to_word(v.value, writePtr, labelLookup),
-        ) catch {
-            try labelLookup.remove(v.label);
-            sqAsm.append(allocator, v);
-        };
-        writePtr += @sizeOf(sq.Word);
+    errdefer state.memory.deinit();
+
+    var labelLookup = try resolveLabels(allocator, entries);
+    defer labelLookup.deinit();
+
+    for (entries, 0..) |entry, i| {
+        const addr = entryAddr(i);
+        state.write(sq.Word, addr, try value_to_word(entry.value, addr, labelLookup));
     }
 
     for (tokens) |token|
         state.push(token);
 
     return state;
+}
+
+test "labels resolve in both directions" {
+    const allocator = std.testing.allocator;
+    var state = try create_image(allocator, &.{
+        .{ .label = "a", .value = .{ .monadic = .{ .d = .l("b") } } },
+        .{ .label = "b", .value = .{ .monadic = .{ .d = .l("a") } } },
+        .{ .label = "c", .value = .{ .monadic = .{ .d = .halt } } },
+    }, &.{}, 0x1000);
+    defer state.memory.deinit();
+
+    const word = @sizeOf(sq.Word);
+    const a: sq.Instr = @bitCast(state.read(sq.Instr, image_base));
+    const b: sq.Instr = @bitCast(state.read(sq.Instr, image_base + word));
+    const c: sq.Instr = @bitCast(state.read(sq.Instr, image_base + 2 * word));
+
+    try std.testing.expectEqual(@as(i20, 1), a.data.monadic.d.offset);
+    try std.testing.expectEqual(@as(i20, -1), b.data.monadic.d.offset);
+    try std.testing.expectEqual(
+        -@as(i20, @intCast((image_base + 2 * word) / word)),
+        c.data.monadic.d.offset,
+    );
+}
+
+test "duplicate labels are rejected" {
+    try std.testing.expectError(error.DuplicateLabel, create_image(
+        std.testing.allocator,
+        &.{
+            .{ .label = "a", .value = .{ .monadic = .{ .d = .halt } } },
+            .{ .label = "a", .value = .{ .monadic = .{ .d = .halt } } },
+        },
+        &.{},
+        0x1000,
+    ));
 }
