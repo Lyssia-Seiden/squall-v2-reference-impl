@@ -6,17 +6,29 @@ pub const Port = enum(u1) { Left, Right };
 
 pub fn AlignedSqPtr(a: comptime_int) type {
     return packed struct {
-        repr: @Int(.unsigned, @typeInfo(SqPtr).int.bits - a),
+        repr: Repr,
+
+        const Self = @This();
+        pub const Repr = @Int(.unsigned, @typeInfo(SqPtr).int.bits - a);
+        pub const SignedRepr = @Int(.signed, @typeInfo(SqPtr).int.bits - a);
 
         pub const Error = error{Misaligned};
 
-        pub fn parse(ptr: SqPtr) Error!AlignedSqPtr(a) {
+        pub fn parse(ptr: SqPtr) Error!Self {
             if (ptr & ((1 << a) - 1) != 0) return Error.Misaligned;
             return .{ .repr = @intCast(ptr >> a) };
         }
 
-        pub fn addr(self: AlignedSqPtr(a)) SqPtr {
+        pub fn addr(self: Self) SqPtr {
             return @as(SqPtr, self.repr) << a;
+        }
+
+        pub fn offsetBy(self: Self, units: anytype) Self {
+            const delta: Repr = if (@typeInfo(@TypeOf(units)).int.signedness == .signed)
+                @bitCast(@as(SignedRepr, units))
+            else
+                units;
+            return .{ .repr = self.repr +% delta };
         }
     };
 }
@@ -41,7 +53,7 @@ pub const Tag = packed struct(u62) {
 
     pub fn offsetWith(self: Tag, dest: Dest) Tag {
         return .{
-            .ip = AlignedSqPtr(3).parse(@intCast((@as(PtrArith, dest.offset) << 3) +% @as(PtrArith, self.ip.addr()))) catch unreachable,
+            .ip = self.ip.offsetBy(dest.offset),
             .fp = self.fp,
             .port = dest.port,
         };
@@ -49,8 +61,11 @@ pub const Tag = packed struct(u62) {
 };
 pub const Word = u64; // accumulator / memory word
 pub const EffWord = u62; // alu / non-pb word
-/// Wide enough to hold any SqPtr plus a signed instruction offset without wrapping.
-pub const PtrArith = i34;
+
+pub fn extendImm(imm: i32) Word {
+    return @bitCast(@as(@Int(.signed, @typeInfo(Word).int.bits), imm));
+}
+
 pub const Token = packed struct(u128) {
     pad: u2 = 0,
     tag: Tag,
@@ -90,7 +105,9 @@ pub const MonadicInstr = packed struct(u62) {
     imm: i32,
 };
 pub const DyadicInstr = packed struct(u62) {
-    addr: u11, // interpreted as signed for code relative constants
+    // interpreted as signed for code relative constants
+    // words not bytes
+    addr: u11,
     addr_tag: enum(u2) {
         FrameRelative,
         CodeRelative,
@@ -103,11 +120,12 @@ pub const DyadicInstr = packed struct(u62) {
     matching_rule: enum(u2) { Once, Const, Read },
     d: Dest,
     forming_rule_tag: enum(u2) { Arith, Reserved, Extract, Send },
-    forming_rule_payload: packed union(u6) {
-        arith: packed struct(u6) { alu_op: AluOp },
-        nothing: u6,
+    forming_rule_payload: packed union(u24) {
+        arith: packed struct(u24) { alu_op: AluOp, pad: u18 = 0 },
+        // the tag Extract mints points here, rather than at `d`
+        extract: packed struct(u24) { d2: Dest, pad: u3 = 0 },
+        nothing: u24,
     },
-    pad: u18,
 };
 pub const Instr = packed struct(u64) {
     tag: enum(u2) { Monadic, Dyadic, Write },
@@ -115,8 +133,8 @@ pub const Instr = packed struct(u64) {
         monadic: MonadicInstr,
         dyadic: DyadicInstr,
         write: packed struct(u62) {
-            ptr: SqPtr,
-            pad: u30,
+            ptr: AlignedSqPtr(3),
+            pad: u33 = 0,
         },
     },
 };
@@ -170,8 +188,8 @@ fn clock_token(state: *State, token: Token) void {
             const data = instr.data.monadic;
             const maybe_l, const maybe_r = apply_alu(
                 data.alu_op,
-                if (token.tag.port == .Left) token.acc else @intCast(data.imm),
-                if (token.tag.port == .Right) token.acc else @intCast(data.imm),
+                if (token.tag.port == .Left) token.acc else extendImm(data.imm),
+                if (token.tag.port == .Right) token.acc else extendImm(data.imm),
             );
             if (maybe_l) |l| {
                 state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = l });
@@ -190,11 +208,12 @@ fn clock_token(state: *State, token: Token) void {
         },
         .Dyadic => {
             const data = instr.data.dyadic;
-            const addr: SqPtr = switch (data.addr_tag) {
-                .FrameRelative => @intCast(@as(PtrArith, token.tag.fp.addr()) + @as(PtrArith, data.addr)),
-                .CodeRelative => @intCast(@as(PtrArith, token.tag.ip.addr()) + @as(PtrArith, @as(i11, @bitCast(data.addr)))),
-                .Absolute => data.addr,
+            const slot: AlignedSqPtr(3) = switch (data.addr_tag) {
+                .FrameRelative => token.tag.fp.offsetBy(data.addr),
+                .CodeRelative => token.tag.ip.offsetBy(@as(i11, @bitCast(data.addr))),
+                .Absolute => .{ .repr = data.addr },
             };
+            const addr = slot.addr();
 
             const other: MemValue = @bitCast(state.read(MemValue, addr));
             if (data.matching_rule != .Read) {
@@ -250,20 +269,25 @@ fn clock_token(state: *State, token: Token) void {
                                 )),
                                 .acc = v,
                             });
+                            state.push(.{
+                                .tag = token.tag.offsetWith(data.dyadic.d),
+                                .acc = v,
+                            });
                         }
                     }
                 },
                 .Extract => {
+                    const minted = token.tag.offsetWith(data.forming_rule_payload.extract.d2);
                     state.push(.{
                         .tag = token.tag.offsetWith(data.d),
-                        .acc = @as(EffWord, @bitCast(token.tag)),
+                        .acc = @as(EffWord, @bitCast(minted)),
                     });
                 },
                 .Reserved => unreachable,
             }
         },
         .Write => {
-            state.write(Word, instr.data.write.ptr, token.acc);
+            state.write(Word, instr.data.write.ptr.addr(), token.acc);
         },
     }
 }
