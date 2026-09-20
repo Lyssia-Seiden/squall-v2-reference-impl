@@ -11,7 +11,7 @@ pub fn AlignedSqPtr(a: comptime_int) type {
         pub const Error = error{Misaligned};
 
         pub fn parse(ptr: SqPtr) Error!AlignedSqPtr(a) {
-            if (ptr & ((2 << a) - 1) != 0) return Error.Misaligned;
+            if (ptr & ((1 << a) - 1) != 0) return Error.Misaligned;
             return .{ .repr = @intCast(ptr >> a) };
         }
 
@@ -21,21 +21,27 @@ pub fn AlignedSqPtr(a: comptime_int) type {
     };
 }
 
+test "sqptr align" {
+    for (0..64) |i| {
+        std.testing.expectEqual(i % 4 == 0, AlignedSqPtr(2).parse(i) != .Misaligned);
+    }
+}
+
 /// Small enough to fit in the non-pb part of a word
 pub const Tag = packed struct(u62) {
-    // 4 byte == word aligned
-    ip: AlignedSqPtr(4),
+    // 2^3 == 8 byte == word aligned
+    ip: AlignedSqPtr(3),
     fp: AlignedSqPtr(3),
     port: Port,
-    pad: u4 = 0,
+    pad: u3 = 0,
 
-    pub fn init(ip: AlignedSqPtr(4), fp: AlignedSqPtr(3), port: Port) Tag {
+    pub fn init(ip: AlignedSqPtr(3), fp: AlignedSqPtr(3), port: Port) Tag {
         return .{ .ip = ip, .fp = fp, .port = port };
     }
 
     pub fn offsetWith(self: Tag, dest: Dest) Tag {
         return .{
-            .ip = .parse(@intCast((@as(PtrArith, dest.offset) << 3) +% @as(PtrArith, self.ip.addr()))),
+            .ip = AlignedSqPtr(3).parse(@intCast((@as(PtrArith, dest.offset) << 3) +% @as(PtrArith, self.ip.addr()))) catch unreachable,
             .fp = self.fp,
             .port = dest.port,
         };
@@ -101,7 +107,7 @@ pub const DyadicInstr = packed struct(u62) {
         arith: packed struct(u6) { alu_op: AluOp },
         nothing: u6,
     },
-    pad: u19,
+    pad: u18,
 };
 pub const Instr = packed struct(u64) {
     tag: enum(u2) { Monadic, Dyadic, Write },
@@ -164,8 +170,8 @@ fn clock_token(state: *State, token: Token) void {
             const data = instr.data.monadic;
             const maybe_l, const maybe_r = apply_alu(
                 data.alu_op,
-                if (token.tag.port == .Left) token.acc else data.imm,
-                if (token.tag.port == .Right) token.acc else data.imm,
+                if (token.tag.port == .Left) token.acc else @intCast(data.imm),
+                if (token.tag.port == .Right) token.acc else @intCast(data.imm),
             );
             if (maybe_l) |l| {
                 state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = l });
@@ -183,134 +189,93 @@ fn clock_token(state: *State, token: Token) void {
             }
         },
         .Dyadic => {
-            // claude plz
+            const data = instr.data.dyadic;
+            const addr: SqPtr = switch (data.addr_tag) {
+                .FrameRelative => @intCast(@as(PtrArith, token.tag.fp.addr()) + @as(PtrArith, data.addr)),
+                .CodeRelative => @intCast(@as(PtrArith, token.tag.ip.addr()) + @as(PtrArith, @as(i11, @bitCast(data.addr)))),
+                .Absolute => data.addr,
+            };
+
+            const other: MemValue = @bitCast(state.read(MemValue, addr));
+            if (data.matching_rule != .Read) {
+                if (other.pb == .Empty) {
+                    const new_pb: PresenceBits =
+                        if (data.matching_rule == .Const and token.tag.port == .Right)
+                            .Constant
+                        else
+                            .Present;
+                    state.write(MemValue, addr, .{
+                        .pb = new_pb,
+                        .val = @truncate(token.acc),
+                    });
+                    return;
+                } else if (other.pb == .Present) {
+                    const new_pb: PresenceBits =
+                        if (data.matching_rule == .Const and token.tag.port == .Right)
+                            .Constant
+                        else
+                            .Empty;
+                    state.write(MemValue, addr, .{
+                        .pb = new_pb,
+                        .val = @truncate(token.acc),
+                    });
+                }
+            }
+
+            const other_acc: Word = other.val;
+            const maybe_l, const maybe_r = apply_alu(
+                switch (data.forming_rule_tag) {
+                    .Arith => data.forming_rule_payload.arith.alu_op,
+                    else => .Nop,
+                },
+                if (token.tag.port == .Left) token.acc else other_acc,
+                if (token.tag.port == .Right) token.acc else other_acc,
+            );
+
+            switch (data.forming_rule_tag) {
+                .Arith => {
+                    if (maybe_l) |v| {
+                        state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = v });
+                    }
+                    // todo how handle r token when generated
+                },
+                .Send => {
+                    // both should always exist
+                    if (maybe_l) |tag| {
+                        if (maybe_r) |v| {
+                            state.push(.{
+                                .tag = @bitCast(@as(
+                                    @typeInfo(Tag).@"struct".backing_integer orelse unreachable,
+                                    @truncate(tag),
+                                )),
+                                .acc = v,
+                            });
+                        }
+                    }
+                },
+                .Extract => {
+                    state.push(.{
+                        .tag = token.tag.offsetWith(data.d),
+                        .acc = @as(EffWord, @bitCast(token.tag)),
+                    });
+                },
+                .Reserved => unreachable,
+            }
         },
         .Write => {
             state.write(Word, instr.data.write.ptr, token.acc);
-        }
+        },
     }
 }
-
-//     if (instr.token_matching_rule == .Monadic) {
-//         // dont resolve the other token
-//         const maybe_res_l, const maybe_res_r =
-//             apply_alu(instr.alu_op, token.acc, instr.payload.imm);
-//         const maybe_token_l, const maybe_token_r = form_tokens(
-//             token,
-//             instr,
-//             maybe_res_l,
-//             maybe_res_r,
-//         );
-
-//         if (maybe_token_l) |t| state.push(t);
-//         if (maybe_token_r) |t| state.push(t);
-//         return;
-//     }
-
-//     const effective_address: SqPtr = switch (instr.addr_tag) {
-//         .FrameRelative => @intCast(@as(PtrArith, token.tag.fp.addr()) + @as(PtrArith, instr.addr.unsigned)),
-//         .CodeRelative => @intCast(@as(PtrArith, token.tag.ip) + instr.addr.signed),
-//         .Absolute => instr.addr.unsigned,
-//     };
-
-//     const other: MemValue = @bitCast(state.read(MemValue, effective_address));
-//     if (other.pb == .Empty) { // the value is garbage
-//         const new_pb: PresenceBits =
-//             if (instr.token_matching_rule == .ConstDyadic and token.tag.port == .Right)
-//                 .Constant
-//             else
-//                 .Present;
-//         state.write(
-//             MemValue,
-//             effective_address,
-//             .{ .pb = new_pb, .val = @truncate(token.acc) },
-//         );
-//         return; // and wait for our other token to join :D
-//     } else if (other.pb == .Present) {
-//         const new_pb: PresenceBits =
-//             if (instr.token_matching_rule == .ConstDyadic and token.tag.port == .Right)
-//                 .Constant
-//             else
-//                 .Empty;
-//         state.write(
-//             MemValue,
-//             effective_address,
-//             .{ .pb = new_pb, .val = @truncate(token.acc) },
-//         );
-//     }
-
-//     const other_acc: Word = other.val; // gangalang what are our signedness semantics
-//     const maybe_res_l, const maybe_res_r = apply_alu(
-//         instr.alu_op,
-//         if (token.tag.port == .Left) token.acc else other_acc,
-//         if (token.tag.port == .Right) token.acc else other_acc,
-//     );
-//     const maybe_token_l, const maybe_token_r = form_tokens(
-//         token,
-//         instr,
-//         maybe_res_l,
-//         maybe_res_r,
-//     );
-
-//     if (maybe_token_l) |t| state.push(t);
-//     if (maybe_token_r) |t| state.push(t);
-// }
 
 fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
     return switch (op) {
-        .nop => .{ val_l, val_r },
-        .add => {
+        .Nop => .{ val_l, val_r },
+        .Add => {
             const res, const ov = @addWithOverflow(val_l, val_r);
             return .{ res, ov };
         },
+        .Shl => .{ val_l << @truncate(val_r), null },
         else => unreachable, // todo
     };
-}
-
-fn form_tokens(from: Token, instr: Instr, val_l: ?Word, val_r: ?Word) struct { ?Token, ?Token } {
-    var res: struct { ?Token, ?Token } = .{ null, null };
-    switch (instr.token_forming_rule) {
-        .Arith => {
-            if (val_l) |v| {
-                res.@"0" = Token{ .tag = from.tag.offsetWith(instr.d1), .acc = v };
-            }
-            if (val_r) |v| {
-                res.@"1" = Token{ .tag = from.tag.offsetWith(instr.d2), .acc = v };
-            }
-            return res;
-        },
-        .Switch => {
-            if (val_r) |condition| {
-                if (val_l) |v| {
-                    const taken = Token{ .tag = from.tag.offsetWith(instr.d2), .acc = v };
-                    if (condition != 0) res.@"0" = taken else res.@"1" = taken;
-                }
-            }
-            // empty when one of these is missing; should never happen
-            return res;
-        },
-        .Send => {
-            if (val_l) |tag| {
-                if (val_r) |v| {
-                    res.@"0" = .{
-                        .tag = @bitCast(@as(
-                            @typeInfo(Tag).@"struct".backing_integer orelse unreachable(),
-                            @truncate(tag),
-                        )),
-                        .acc = v,
-                    };
-                    res.@"1" = Token{ .tag = from.tag.offsetWith(instr.d1), .acc = v };
-                }
-            }
-            // as before, we should always have both values for this
-            return res;
-        },
-        .Extract => {
-            res.@"0" = Token{
-                .tag = from.tag.offsetWith(instr.d1),
-                .acc = @as(EffWord, @bitCast(from.tag.offsetWith(instr.d2))),
-            };
-            return res;
-        },
-    }
 }
