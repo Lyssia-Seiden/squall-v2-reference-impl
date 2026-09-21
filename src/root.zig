@@ -89,24 +89,26 @@ pub const MemValue = packed struct(u64) { val: u62, pb: PresenceBits };
 pub const Dest = packed struct { offset: i20, port: Port };
 pub const AluOp = enum(u6) {
     // binary
-    Nop,
-    Add,
+    Nop = 0,
+    Add = 4,
     Sub,
-    And,
-    Or,
-    Xor,
     Mul,
     Div,
+    Rem,
+    Mod,
+    And = 16,
+    Or,
+    Xor,
     Shl,
     Shrl,
     Shra,
     // unary
-    Not,
+    Not = 24,
     Rev,
     Dupl,
     Dupr,
     // switch - two operands, one of two outputs
-    Beqz,
+    Beqz = 32,
     Beql,
     Beqr,
 };
@@ -337,9 +339,38 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
             return .{ @truncate(res), @truncate(res >> 64) };
         },
         .Div => {
-            const res = @divTrunc(val_l, val_r);
-            // todo make second token 0, nonexact codes
-            return .{ res, null };
+            var flags: packed struct { divByZero: bool, truncated: bool } = @bitCast(@as(u2, 0));
+            var res: Word = 0;
+            if (val_r == 0) {
+                flags.divByZero = true;
+            } else {
+                flags.divByZero = false;
+                res = @divTrunc(val_l, val_r);
+                if (@rem(val_l, val_r) != 0) flags.truncated = true;
+            }
+            return .{ res, @as(u2, @bitCast(flags)) };
+        },
+        .Mod => {
+            var flags: packed struct { divByZero: bool } = @bitCast(@as(u1, 0));
+            var res: Word = 0;
+            if (val_r == 0) {
+                flags.divByZero = true;
+            } else {
+                flags.divByZero = false;
+                res = @mod(val_l, val_r);
+            }
+            return .{ res, @as(u1, @bitCast(flags)) };
+        },
+        .Rem => {
+            var flags: packed struct { divByZero: bool } = @bitCast(@as(u1, 0));
+            var res: Word = 0;
+            if (val_r == 0) {
+                flags.divByZero = true;
+            } else {
+                flags.divByZero = false;
+                res = @rem(val_l, val_r);
+            }
+            return .{ res, @as(u1, @bitCast(flags)) };
         },
         .Shl => .{ val_l << @truncate(val_r), null },
         .Shrl => .{ val_l >> @truncate(val_r), null },
