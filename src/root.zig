@@ -94,6 +94,7 @@ pub const AluOp = enum(u6) {
     Sub,
     Mul,
     Div,
+    Divu,
     Rem,
     Mod,
     And = 16,
@@ -345,6 +346,18 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
                 flags.divByZero = true;
             } else {
                 flags.divByZero = false;
+                res = @bitCast(@divTrunc(@as(SignedWord, @bitCast(val_l)), @as(SignedWord, @bitCast(val_r))));
+                if (@rem(@as(SignedWord, @bitCast(val_l)), @as(SignedWord, @bitCast(val_r))) != 0) flags.truncated = true;
+            }
+            return .{ res, @as(u2, @bitCast(flags)) };
+        },
+        .Divu => {
+            var flags: packed struct { divByZero: bool, truncated: bool } = @bitCast(@as(u2, 0));
+            var res: Word = 0;
+            if (val_r == 0) {
+                flags.divByZero = true;
+            } else {
+                flags.divByZero = false;
                 res = @divTrunc(val_l, val_r);
                 if (@rem(val_l, val_r) != 0) flags.truncated = true;
             }
@@ -357,7 +370,7 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
                 flags.divByZero = true;
             } else {
                 flags.divByZero = false;
-                res = @mod(val_l, val_r);
+                res = @bitCast(@mod(@as(SignedWord, @bitCast(val_l)), @as(SignedWord, @bitCast(val_r))));
             }
             return .{ res, @as(u1, @bitCast(flags)) };
         },
@@ -368,7 +381,7 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
                 flags.divByZero = true;
             } else {
                 flags.divByZero = false;
-                res = @rem(val_l, val_r);
+                res = @bitCast(@rem(@as(SignedWord, @bitCast(val_l)), @as(SignedWord, @bitCast(val_r))));
             }
             return .{ res, @as(u1, @bitCast(flags)) };
         },
