@@ -135,7 +135,12 @@ pub const DyadicInstr = packed struct(u62) {
     d: Dest,
     forming_rule_tag: enum(u2) { Arith, Reserved, Extract, Send },
     forming_rule_payload: packed union(u24) {
-        arith: packed struct(u24) { alu_op: AluOp, pad: u18 = 0 },
+        arith: packed struct(u24) {
+            alu_op: AluOp,
+            send_second_token: bool, // on true we send to { second_token_port, +8 bytes }
+            second_token_port: Port, // only meaningful if above is set
+            pad: u16 = 0,
+        },
         // the tag Extract mints points here, rather than at `d`
         extract: packed struct(u24) { d2: Dest, pad: u3 = 0 },
         nothing: u24,
@@ -270,7 +275,17 @@ fn clock_token(state: *State, token: Token) void {
                     if (maybe_l) |v| {
                         state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = v });
                     }
-                    // todo how handle r token when generated
+                    if (maybe_r) |v| {
+                        if (data.forming_rule_payload.arith.send_second_token) {
+                            state.push(.{
+                                .tag = token.tag.offsetWith(.{
+                                    .offset = 1,
+                                    .port = data.forming_rule_payload.arith.second_token_port,
+                                }),
+                                .acc = v,
+                            });
+                        }
+                    }
                 },
                 .Send => {
                     // both should always exist

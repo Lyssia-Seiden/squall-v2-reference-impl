@@ -121,6 +121,7 @@ pub const Dyadic = struct {
     matching: MatchingRule,
     form: Form,
     d: Ref,
+    second: ?Second,
 };
 
 pub const Target = union(enum) { label: Label, addr: sq.SqPtr };
@@ -159,7 +160,11 @@ fn value_to_word(
                 .addr = try data.slot.toAddrPayload(thisAddr, labelLookup),
                 .forming_rule_tag = data.form.toFormingRuleTag(),
                 .forming_rule_payload = switch (data.form) {
-                    .arith => |a| .{ .arith = .{ .alu_op = a } },
+                    .arith => |a| .{ .arith = .{
+                        .alu_op = a,
+                        .send_second_token = data.second != null,
+                        .second_token_port = if (data.second) |s| s.port else .Left,
+                    } },
                     .send => .{ .nothing = 0 },
                     .extract => |v| .{ .extract = .{
                         .d2 = try refDest(v, thisAddr, labelLookup),
