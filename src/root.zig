@@ -259,7 +259,7 @@ fn clock_token(state: *State, token: Token) void {
                             .Empty;
                     state.write(MemValue, addr, .{
                         .pb = new_pb,
-                        .val = @truncate(token.acc),
+                        .val = if (new_pb == .Empty) undefined else @truncate(token.acc),
                     });
                 }
             }
