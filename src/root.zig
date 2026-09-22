@@ -115,13 +115,26 @@ pub const AluOp = enum(u6) {
 };
 pub const MonadicInstr = packed struct(u62) {
     alu_op: AluOp,
-    pad: u1 = 0,
-    d: Dest,
     send_second_token: bool, // on true we send to { second_token_port, +8 bytes }
     second_token_port: Port, // only meaningful if above is set
     imm: i32,
+    pad: u1 = 0,
+    d: Dest,
 };
 pub const DyadicInstr = packed struct(u62) {
+    // matches monadic's alu_op position
+    forming_rule_payload: packed union(u24) {
+        arith: packed struct(u24) {
+            alu_op: AluOp,
+            send_second_token: bool, // on true we send to { second_token_port, +8 bytes }
+            second_token_port: Port, // only meaningful if above is set
+            pad: u16 = 0,
+        },
+        // the tag Extract mints points here, rather than at `d`
+        extract: packed struct(u24) { d2: Dest, pad: u3 = 0 },
+        nothing: u24,
+    },
+    forming_rule_tag: enum(u2) { Arith, Reserved, Extract, Send },
     // interpreted as signed for code relative constants
     // words not bytes
     addr: u11,
@@ -136,18 +149,6 @@ pub const DyadicInstr = packed struct(u62) {
     // read takes the full value of a location unconditionally
     matching_rule: enum(u2) { Once, Const, Read },
     d: Dest,
-    forming_rule_tag: enum(u2) { Arith, Reserved, Extract, Send },
-    forming_rule_payload: packed union(u24) {
-        arith: packed struct(u24) {
-            alu_op: AluOp,
-            send_second_token: bool, // on true we send to { second_token_port, +8 bytes }
-            second_token_port: Port, // only meaningful if above is set
-            pad: u16 = 0,
-        },
-        // the tag Extract mints points here, rather than at `d`
-        extract: packed struct(u24) { d2: Dest, pad: u3 = 0 },
-        nothing: u24,
-    },
 };
 pub const Instr = packed struct(u64) {
     tag: enum(u2) { Monadic, Dyadic, Write },
