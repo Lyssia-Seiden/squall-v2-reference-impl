@@ -188,8 +188,12 @@ pub const State = struct {
         self.stackTop -= @sizeOf(Token);
     }
 
+    pub fn quiescent(self: *const State) bool {
+        return self.stackTop >= self.stackBase;
+    }
+
     pub fn pop(self: *State) ?Token {
-        if (self.stackTop >= self.stackBase) return null;
+        if (self.quiescent()) return null;
         self.stackTop += @sizeOf(Token);
         return @as(Token, @bitCast(self.read(Token, self.stackTop)));
     }
@@ -198,7 +202,6 @@ pub const State = struct {
 pub fn clock(state: *State) void {
     const token = if (state.pop()) |t| t else return;
     // Absolute(0) address is a dump
-    std.debug.print("{}\n", .{token});
     if (token.tag.ip.addr() == 0x00) return;
     clock_token(state, token);
 }

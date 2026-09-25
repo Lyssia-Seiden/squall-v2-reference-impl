@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
         .value = .{ .monadic = .{
             .d = .{ .node = .{ .label = "plus1", .port = .Left } },
             .op = .Mul,
-            .imm = 2,
+            .imm = .{ .literal = 2 },
             .second = null,
         } },
     });
@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
         .value = .{ .monadic = .{
             .d = .{ .node = .{ .label = "double", .port = .Left } },
             .op = .Add,
-            .imm = 1,
+            .imm = .{ .literal = 1 },
             .second = null,
         } },
     });

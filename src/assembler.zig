@@ -32,6 +32,7 @@ pub const AddrError = error{
     NoAddrForLabel,
     MisalignedTarget,
     OffsetOutOfRange,
+    SecondTokenNotAdjacent,
 };
 
 /// Distance from `here` to `there` in words, the unit every encoded offset uses.
@@ -59,11 +60,41 @@ fn refDest(ref: Ref, here: sq.SqPtr, labelLookup: LabelLookup) AddrError!sq.Dest
     };
 }
 
+/// The hardware fixes the second destination at `ip + 1`, so `label` is checked
+/// rather than encoded.
 pub const Second = struct { label: Label, port: sq.Port = .Left };
+
+fn checkSecond(
+    second: ?Second,
+    here: sq.SqPtr,
+    labelLookup: LabelLookup,
+) AddrError!void {
+    const s = second orelse return;
+    const target = labelLookup.get(s.label) orelse return error.NoAddrForLabel;
+    if (target != here + @sizeOf(sq.Word)) return error.SecondTokenNotAdjacent;
+}
+
+pub const Imm = union(enum) {
+    literal: i32,
+    /// Word distance between two labels, for building tags of code the
+    /// instruction cannot name directly.
+    label_delta: struct { from: Label, to: Label },
+
+    pub fn resolve(self: @This(), labelLookup: LabelLookup) AddrError!i32 {
+        return switch (self) {
+            .literal => |v| v,
+            .label_delta => |d| try wordDeltaAs(
+                i32,
+                labelLookup.get(d.from) orelse return error.NoAddrForLabel,
+                labelLookup.get(d.to) orelse return error.NoAddrForLabel,
+            ),
+        };
+    }
+};
 
 pub const Monadic = struct {
     op: sq.AluOp = .Nop,
-    imm: i32 = 0,
+    imm: Imm = .{ .literal = 0 },
     d: Ref,
     second: ?Second = null,
 };
@@ -103,7 +134,7 @@ pub const Slot = union(enum) {
 };
 
 pub const Form = union(enum) {
-    arith: sq.AluOp,
+    arith: struct { op: sq.AluOp = .Nop, second: ?Second = null },
     send,
     extract: Ref,
 
@@ -121,7 +152,6 @@ pub const Dyadic = struct {
     matching: MatchingRule,
     form: Form,
     d: Ref,
-    second: ?Second,
 };
 
 pub const Target = union(enum) { label: Label, addr: sq.SqPtr };
@@ -146,34 +176,44 @@ fn value_to_word(
     labelLookup: LabelLookup,
 ) !sq.Word {
     return switch (f) {
-        .monadic => |data| @bitCast(sq.Instr{ .tag = .Monadic, .data = .{ .monadic = .{
-            .alu_op = data.op,
-            .d = try refDest(data.d, thisAddr, labelLookup),
-            .send_second_token = data.second != null,
-            .second_token_port = if (data.second) |s| s.port else .Left,
-            .imm = data.imm,
-        } } }),
-        .dyadic => |data| @bitCast(sq.Instr{
-            .tag = .Dyadic,
-            .data = .{ .dyadic = .{
-                .addr_tag = data.slot.toAddrTag(),
-                .addr = try data.slot.toAddrPayload(thisAddr, labelLookup),
-                .forming_rule_tag = data.form.toFormingRuleTag(),
-                .forming_rule_payload = switch (data.form) {
-                    .arith => |a| .{ .arith = .{
-                        .alu_op = a,
-                        .send_second_token = data.second != null,
-                        .second_token_port = if (data.second) |s| s.port else .Left,
-                    } },
-                    .send => .{ .nothing = 0 },
-                    .extract => |v| .{ .extract = .{
-                        .d2 = try refDest(v, thisAddr, labelLookup),
-                    } },
-                },
+        .monadic => |data| blk: {
+            try checkSecond(data.second, thisAddr, labelLookup);
+            break :blk @bitCast(sq.Instr{ .tag = .Monadic, .data = .{ .monadic = .{
+                .alu_op = data.op,
                 .d = try refDest(data.d, thisAddr, labelLookup),
-                .matching_rule = data.matching,
-            } },
-        }),
+                .send_second_token = data.second != null,
+                .second_token_port = if (data.second) |s| s.port else .Left,
+                .imm = try data.imm.resolve(labelLookup),
+            } } });
+        },
+        .dyadic => |data| blk: {
+            if (data.form == .arith) try checkSecond(
+                data.form.arith.second,
+                thisAddr,
+                labelLookup,
+            );
+            break :blk @bitCast(sq.Instr{
+                .tag = .Dyadic,
+                .data = .{ .dyadic = .{
+                    .addr_tag = data.slot.toAddrTag(),
+                    .addr = try data.slot.toAddrPayload(thisAddr, labelLookup),
+                    .forming_rule_tag = data.form.toFormingRuleTag(),
+                    .forming_rule_payload = switch (data.form) {
+                        .arith => |a| .{ .arith = .{
+                            .alu_op = a.op,
+                            .send_second_token = a.second != null,
+                            .second_token_port = if (a.second) |s| s.port else .Left,
+                        } },
+                        .send => .{ .nothing = 0 },
+                        .extract => |v| .{ .extract = .{
+                            .d2 = try refDest(v, thisAddr, labelLookup),
+                        } },
+                    },
+                    .d = try refDest(data.d, thisAddr, labelLookup),
+                    .matching_rule = data.matching,
+                } },
+            });
+        },
         .write => |data| @bitCast(sq.Instr{
             .tag = .Write,
             .data = .{ .write = .{
@@ -198,7 +238,7 @@ fn entryAddr(index: usize) sq.SqPtr {
 
 /// Addresses are fixed by position, so a full map is available before any
 /// entry is encoded and forward references resolve like backward ones.
-fn resolveLabels(allocator: std.mem.Allocator, entries: []const Entry) !LabelLookup {
+pub fn resolveLabels(allocator: std.mem.Allocator, entries: []const Entry) !LabelLookup {
     var labelLookup: LabelLookup = .init(allocator);
     errdefer labelLookup.deinit();
     for (entries, 0..) |entry, i| {
@@ -256,6 +296,30 @@ test "labels resolve in both directions" {
         -@as(i20, @intCast((image_base + 2 * word) / word)),
         c.data.monadic.d.offset,
     );
+}
+
+test "second token destinations must be the next instruction" {
+    const nonadjacent: []const Entry = &.{
+        .{ .label = "a", .value = .{ .monadic = .{
+            .d = .halt,
+            .second = .{ .label = "c" },
+        } } },
+        .{ .label = "b", .value = .{ .monadic = .{ .d = .halt } } },
+        .{ .label = "c", .value = .{ .monadic = .{ .d = .halt } } },
+    };
+    try std.testing.expectError(
+        error.SecondTokenNotAdjacent,
+        create_image(std.testing.allocator, nonadjacent, &.{}, 0x1000),
+    );
+
+    var state = try create_image(std.testing.allocator, &.{
+        .{ .label = "a", .value = .{ .monadic = .{
+            .d = .halt,
+            .second = .{ .label = "b" },
+        } } },
+        .{ .label = "b", .value = .{ .monadic = .{ .d = .halt } } },
+    }, &.{}, 0x1000);
+    state.memory.deinit();
 }
 
 test "duplicate labels are rejected" {
