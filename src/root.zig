@@ -247,11 +247,13 @@ fn clock_token(state: *State, token: Token) void {
                     const new_pb: PresenceBits =
                         if (data.matching_rule == .Const and token.tag.port == .Right)
                             .Constant
+                        else if (data.matching_rule == .Const and token.tag.port == .Left)
+                            .Empty
                         else
                             .Present;
                     state.write(MemValue, addr, .{
                         .pb = new_pb,
-                        .val = @truncate(token.acc),
+                        .val = if (new_pb == .Empty) undefined else @truncate(token.acc),
                     });
                     return;
                 } else if (other.pb == .Present) {
