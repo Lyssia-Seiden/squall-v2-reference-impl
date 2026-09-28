@@ -266,6 +266,13 @@ fn clock_token(state: *State, token: Token) void {
                         .pb = new_pb,
                         .val = if (new_pb == .Empty) undefined else @truncate(token.acc),
                     });
+                } else if (
+                    other.pb == .Constant and data.matching_rule == .Const and token.tag.port == .Right
+                ) {
+                    state.write(MemValue, addr, .{
+                        .pb = .Constant,
+                        .val = @truncate(token.acc),
+                    });
                 }
             }
 
