@@ -112,6 +112,8 @@ pub const AluOp = enum(u6) {
     Beqz = 32,
     Beql,
     Beqr,
+    Bler,
+    Blel,
 };
 pub const MonadicInstr = packed struct(u62) {
     alu_op: AluOp,
@@ -419,6 +421,14 @@ fn apply_alu(op: AluOp, val_l: Word, val_r: Word) struct { ?Word, ?Word } {
         .Beqr => .{
             if (val_l != val_r) val_r else null,
             if (val_l == val_r) val_r else null,
+        },
+        .Blel => .{
+            if (val_l <= val_r) val_l else null,
+            if (val_l > val_r) val_l else null,
+        },
+        .Bler => .{
+            if (val_l <= val_r) val_r else null,
+            if (val_l > val_r) val_r else null,
         },
     };
 }
