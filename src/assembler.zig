@@ -5,6 +5,8 @@ pub const MatchingRule = @FieldType(sq.DyadicInstr, "matching_rule");
 pub const AddrTag = @FieldType(sq.DyadicInstr, "addr_tag");
 pub const FormingRuleTag = @FieldType(sq.DyadicInstr, "forming_rule_tag");
 pub const FormingRulePayload = @FieldType(sq.DyadicInstr, "forming_rule_payload");
+pub const SlotAddr = @FieldType(sq.DyadicInstr, "addr");
+const SignedSlotAddr = @Int(.signed, @bitSizeOf(SlotAddr));
 
 pub const Label = []const u8;
 pub const LabelLookup = std.StringHashMap(sq.SqPtr);
@@ -99,8 +101,13 @@ pub const Monadic = struct {
     second: ?Second = null,
 };
 
+pub const Extract = struct {
+    d: Ref,
+    mint: Ref,
+};
+
 pub const Slot = union(enum) {
-    frame_words: u11,
+    frame_words: SlotAddr,
     absolute_addr: sq.SqPtr,
     code: Label,
 
@@ -116,16 +123,16 @@ pub const Slot = union(enum) {
         self: @This(),
         here: sq.SqPtr,
         labelLookup: LabelLookup,
-    ) AddrError!u11 {
+    ) AddrError!SlotAddr {
         return switch (self) {
             .frame_words => |v| v,
             .absolute_addr => |v| blk: {
                 if (v % @sizeOf(sq.Word) != 0) return error.MisalignedTarget;
-                break :blk std.math.cast(u11, v / @sizeOf(sq.Word)) orelse
+                break :blk std.math.cast(SlotAddr, v / @sizeOf(sq.Word)) orelse
                     error.OffsetOutOfRange;
             },
             .code => |v| @bitCast(try wordDeltaAs(
-                i11,
+                SignedSlotAddr,
                 here,
                 labelLookup.get(v) orelse return error.NoAddrForLabel,
             )),
@@ -136,13 +143,11 @@ pub const Slot = union(enum) {
 pub const Form = union(enum) {
     arith: struct { op: sq.AluOp = .Nop, second: ?Second = null },
     send,
-    extract: Ref,
 
     pub fn toFormingRuleTag(self: @This()) FormingRuleTag {
         return switch (self) {
             .arith => .Arith,
             .send => .Send,
-            .extract => .Extract,
         };
     }
 };
@@ -164,6 +169,7 @@ pub const Write = struct {
 
 pub const AsmField = union(enum) {
     monadic: Monadic,
+    extract: Extract,
     dyadic: Dyadic,
     write: Write,
     value: sq.MemValue,
@@ -187,9 +193,18 @@ fn value_to_word(
                 .d = try refDest(data.d, thisAddr, labelLookup),
                 .send_second_token = data.second != null,
                 .second_token_port = if (data.second) |s| s.port else .Left,
-                .imm = try data.imm.resolve(labelLookup),
+                .payload = .{ .imm = try data.imm.resolve(labelLookup) },
+                .forming_rule = .Arith,
             } } });
         },
+        .extract => |data| @bitCast(sq.Instr{ .tag = .Monadic, .data = .{ .monadic = .{
+            .alu_op = .Nop,
+            .d = try refDest(data.d, thisAddr, labelLookup),
+            .send_second_token = false,
+            .second_token_port = .Left,
+            .payload = .{ .extract = .{ .d2 = try refDest(data.mint, thisAddr, labelLookup) } },
+            .forming_rule = .Extract,
+        } } }),
         .dyadic => |data| blk: {
             if (data.form == .arith) try checkSecond(
                 data.form.arith.second,
@@ -209,9 +224,6 @@ fn value_to_word(
                             .second_token_port = if (a.second) |s| s.port else .Left,
                         } },
                         .send => .{ .nothing = 0 },
-                        .extract => |v| .{ .extract = .{
-                            .d2 = try refDest(v, thisAddr, labelLookup),
-                        } },
                     },
                     .d = try refDest(data.d, thisAddr, labelLookup),
                     .matching_rule = data.matching,

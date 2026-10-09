@@ -119,8 +119,12 @@ pub const MonadicInstr = packed struct(u62) {
     alu_op: AluOp,
     send_second_token: bool, // on true we send to { second_token_port, +8 bytes }
     second_token_port: Port, // only meaningful if above is set
-    imm: i32,
-    pad: u1 = 0,
+    payload: packed union {
+        imm: i32,
+        // the tag Extract mints points here, rather than at `d`
+        extract: packed struct(u32) { d2: Dest, pad: u11 = 0 },
+    },
+    forming_rule: enum(u1) { Arith, Extract },
     d: Dest,
 };
 pub const DyadicInstr = packed struct(u62) {
@@ -132,14 +136,11 @@ pub const DyadicInstr = packed struct(u62) {
             second_token_port: Port, // only meaningful if above is set
             pad: u16 = 0,
         },
-        // the tag Extract mints points here, rather than at `d`
-        extract: packed struct(u24) { d2: Dest, pad: u3 = 0 },
         nothing: u24,
     },
-    forming_rule_tag: enum(u2) { Arith, Reserved, Extract, Send },
     // interpreted as signed for code relative constants
     // words not bytes
-    addr: u11,
+    addr: u12,
     addr_tag: enum(u2) {
         FrameRelative,
         CodeRelative,
@@ -150,6 +151,7 @@ pub const DyadicInstr = packed struct(u62) {
     // const writes Const on the right token, Present on the left, and stays Const once written
     // read takes the full value of a location unconditionally
     matching_rule: enum(u2) { Once, Const, Read },
+    forming_rule_tag: enum(u1) { Arith, Send },
     d: Dest,
 };
 pub const Instr = packed struct(u64) {
@@ -217,31 +219,42 @@ fn clock_token(state: *State, token: Token) void {
     switch (instr.tag) {
         .Monadic => {
             const data = instr.data.monadic;
-            const maybe_l, const maybe_r = apply_alu(
-                data.alu_op,
-                if (token.tag.port == .Left) token.acc else signExtend(data.imm),
-                if (token.tag.port == .Right) token.acc else signExtend(data.imm),
-            );
-            if (maybe_l) |l| {
-                state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = l });
-            }
-            if (maybe_r) |r| {
-                if (data.send_second_token) {
+            switch (data.forming_rule) {
+                .Arith => {
+                    const maybe_l, const maybe_r = apply_alu(
+                        data.alu_op,
+                        if (token.tag.port == .Left) token.acc else signExtend(data.payload.imm),
+                        if (token.tag.port == .Right) token.acc else signExtend(data.payload.imm),
+                    );
+                    if (maybe_l) |l| {
+                        state.push(.{ .tag = token.tag.offsetWith(data.d), .acc = l });
+                    }
+                    if (maybe_r) |r| {
+                        if (data.send_second_token) {
+                            state.push(.{
+                                .tag = token.tag.offsetWith(.{
+                                    .offset = 1,
+                                    .port = data.second_token_port,
+                                }),
+                                .acc = r,
+                            });
+                        }
+                    }
+                },
+                .Extract => {
+                    const minted = token.tag.offsetWith(data.payload.extract.d2);
                     state.push(.{
-                        .tag = token.tag.offsetWith(.{
-                            .offset = 1,
-                            .port = data.second_token_port,
-                        }),
-                        .acc = r,
+                        .tag = token.tag.offsetWith(data.d),
+                        .acc = @as(EffWord, @bitCast(minted)),
                     });
-                }
+                },
             }
         },
         .Dyadic => {
             const data = instr.data.dyadic;
             const slot: AlignedSqPtr(3) = switch (data.addr_tag) {
                 .FrameRelative => token.tag.fp.offsetBy(data.addr),
-                .CodeRelative => token.tag.ip.offsetBy(@as(i11, @bitCast(data.addr))),
+                .CodeRelative => token.tag.ip.offsetBy(@as(i12, @bitCast(data.addr))),
                 .Absolute => .{ .repr = data.addr },
             };
             const addr = slot.addr();
@@ -324,14 +337,6 @@ fn clock_token(state: *State, token: Token) void {
                         }
                     }
                 },
-                .Extract => {
-                    const minted = token.tag.offsetWith(data.forming_rule_payload.extract.d2);
-                    state.push(.{
-                        .tag = token.tag.offsetWith(data.d),
-                        .acc = @as(EffWord, @bitCast(minted)),
-                    });
-                },
-                .Reserved => unreachable,
             }
         },
         .Write => {

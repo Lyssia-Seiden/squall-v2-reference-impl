@@ -91,28 +91,20 @@ const fib_entries = [_]a.Entry{
         .d = .l("ext_ra1"),
         .second = .{ .label = "ext_ra2" },
     } } },
-    .{ .label = "ext_ra2", .value = .{ .dyadic = .{
-        .slot = scratch,
-        .matching = .Read,
-        .form = .{ .extract = .r("ret_join") },
+    .{ .label = "ext_ra2", .value = .{ .extract = .{
+        .mint = .r("ret_join"),
         .d = .r("send_ra2"),
     } } },
-    .{ .label = "ext_ra1", .value = .{ .dyadic = .{
-        .slot = scratch,
-        .matching = .Read,
-        .form = .{ .extract = .l("ret_join") },
+    .{ .label = "ext_ra1", .value = .{ .extract = .{
+        .mint = .l("ret_join"),
         .d = .r("send_ra1"),
     } } },
-    .{ .label = "ext_fp", .value = .{ .dyadic = .{
-        .slot = scratch,
-        .matching = .Read,
-        .form = .{ .extract = .halt },
+    .{ .label = "ext_fp", .value = .{ .extract = .{
+        .mint = .halt,
         .d = .r("child_tag"),
     } } },
-    .{ .label = "ext_entry", .value = .{ .dyadic = .{
-        .slot = scratch,
-        .matching = .Read,
-        .form = .{ .extract = .l("entry_n") },
+    .{ .label = "ext_entry", .value = .{ .extract = .{
+        .mint = .l("entry_n"),
         .d = .l("child_tag"),
     } } },
     .{ .label = "child_tag", .value = .{ .dyadic = .{
@@ -192,8 +184,6 @@ const fib_entries = [_]a.Entry{
     .{ .label = "result", .value = .{ .value = .{ .pb = .Empty, .val = 0 } } },
     .{ .label = "sibling", .value = .{ .value = .{ .pb = .Constant, .val = fib_sibling } } },
 };
-
-const scratch: a.Slot = .{ .absolute_addr = 0 };
 
 const ret_offset: a.Imm = .{ .label_delta = .{ .from = "entry_n", .to = "final_send" } };
 
