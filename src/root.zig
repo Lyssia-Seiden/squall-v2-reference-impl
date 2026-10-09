@@ -159,7 +159,10 @@ pub const Instr = packed struct(u64) {
         dyadic: DyadicInstr,
         write: packed struct(u62) {
             ptr: AlignedSqPtr(3),
-            pad: u33 = 0,
+            byte_enables: u8 = 0b11111111,
+            ack_en: bool,
+            pad: u3 = 0,
+            ack_dest: Dest,
         },
     },
 };
@@ -268,9 +271,7 @@ fn clock_token(state: *State, token: Token) void {
                         .pb = new_pb,
                         .val = if (new_pb == .Empty) undefined else @truncate(token.acc),
                     });
-                } else if (
-                    other.pb == .Constant and data.matching_rule == .Const and token.tag.port == .Right
-                ) {
+                } else if (other.pb == .Constant and data.matching_rule == .Const and token.tag.port == .Right) {
                     state.write(MemValue, addr, .{
                         .pb = .Constant,
                         .val = @truncate(token.acc),
@@ -334,7 +335,18 @@ fn clock_token(state: *State, token: Token) void {
             }
         },
         .Write => {
-            state.write(Word, instr.data.write.ptr.addr(), token.acc);
+            for (0..8) |byte| {
+                if (((instr.data.write.byte_enables >> @truncate(byte)) & 1) == 1)
+                    state.write(
+                        u8,
+                        instr.data.write.ptr.addr() + @as(SqPtr, @intCast(byte)),
+                        @truncate(token.acc >> @truncate(byte * 8)),
+                    );
+            }
+            if (instr.data.write.ack_en) state.push(.{
+                .tag = token.tag.offsetWith(instr.data.write.ack_dest),
+                .acc = token.acc,
+            });
         },
     }
 }

@@ -156,7 +156,11 @@ pub const Dyadic = struct {
 
 pub const Target = union(enum) { label: Label, addr: sq.SqPtr };
 
-pub const Write = struct { target: Target };
+pub const Write = struct {
+    target: Target,
+    ack: ?Ref = null,
+    byte_enables: u8 = 0b11111111,
+};
 
 pub const AsmField = union(enum) {
     monadic: Monadic,
@@ -221,6 +225,9 @@ fn value_to_word(
                     .addr => |a| a,
                     .label => |l| labelLookup.get(l) orelse return error.NoAddrForLabel,
                 }),
+                .ack_en = data.ack != null,
+                .ack_dest = if (data.ack) |ack| try refDest(ack, thisAddr, labelLookup) else .{ .offset = 0, .port = .Left },
+                .byte_enables = data.byte_enables,
             } },
         }),
         .value => |data| @bitCast(sq.MemValue{
