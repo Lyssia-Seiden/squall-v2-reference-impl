@@ -172,7 +172,7 @@ pub const AsmField = union(enum) {
     extract: Extract,
     dyadic: Dyadic,
     write: Write,
-    value: sq.MemValue,
+    value: sq.Word,
 };
 pub const Entry = struct {
     label: Label,
@@ -242,10 +242,7 @@ fn value_to_word(
                 .byte_enables = data.byte_enables,
             } },
         }),
-        .value => |data| @bitCast(sq.MemValue{
-            .pb = data.pb,
-            .val = data.val,
-        }),
+        .value => |data| @bitCast(data),
     };
 }
 

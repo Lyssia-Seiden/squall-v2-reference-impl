@@ -46,13 +46,13 @@ test "sqptr align" {
     }
 }
 
-/// Small enough to fit in the non-pb part of a word
-pub const Tag = packed struct(u62) {
+pub const Tag = packed struct(u64) {
     // 2^3 == 8 byte == word aligned
     ip: AlignedSqPtr(3),
+    pad: u3 = 0,
     fp: AlignedSqPtr(3),
     port: Port,
-    pad: u3 = 0,
+    pad_tail: u2 = 0,
 
     pub fn init(ip: AlignedSqPtr(3), fp: AlignedSqPtr(3), port: Port) Tag {
         return .{ .ip = ip, .fp = fp, .port = port };
@@ -68,7 +68,6 @@ pub const Tag = packed struct(u62) {
 };
 pub const Word = u64; // accumulator / memory word
 pub const SignedWord = i64; // accumulator / memory word
-pub const EffWord = u62; // alu / non-pb word
 
 pub fn signExtend(val: anytype) Word {
     const ty = @typeInfo(@TypeOf(val));
@@ -77,13 +76,47 @@ pub fn signExtend(val: anytype) Word {
 }
 
 pub const Token = packed struct(u128) {
-    pad: u2 = 0,
     tag: Tag,
     acc: Word,
 };
 
 pub const PresenceBits = enum(u2) { Empty, Present, Constant };
-pub const MemValue = packed struct(u64) { val: u62, pb: PresenceBits };
+pub const PresenceBitsBacking = @typeInfo(PresenceBits).@"enum".tag_type;
+pub const PresenceBitWord = packed struct(Word) {
+    repr: Word,
+
+    fn get(self: *const @This(), slot: PbSlot) PresenceBits {
+        const s = @as(std.math.Log2Int(Word), slot) * @bitSizeOf(PresenceBits);
+        return @enumFromInt(@as(
+            PresenceBitsBacking,
+            @truncate(self.repr >> s),
+        ));
+    }
+
+    fn set(self: *@This(), slot: PbSlot, pb: PresenceBits) void {
+        const s = @as(std.math.Log2Int(Word), slot) * @bitSizeOf(PresenceBits);
+        self.repr = (self.repr & ~(@as(Word, std.math.maxInt(PresenceBitsBacking)) << s)) |
+            (@as(Word, @intFromEnum(pb)) << s);
+    }
+};
+
+pub const PbSlot = std.math.Log2Int(@Int(.unsigned, @bitSizeOf(Word) / @bitSizeOf(PresenceBits)));
+
+comptime {
+    std.debug.assert(std.math.isPowerOfTwo(@bitSizeOf(PresenceBits)));
+    std.debug.assert(@bitSizeOf(Word) % @bitSizeOf(PresenceBits) == 0);
+}
+
+pub fn pb_addr_for(ptr: SqPtr) SqPtr {
+    const group_shift = comptime std.math.log2_int(usize, @sizeOf(Word)) + @bitSizeOf(PbSlot);
+    const group_mask: SqPtr = (1 << group_shift) - 1;
+    return ptr & ~group_mask;
+}
+
+pub fn pb_slot_for(ptr: SqPtr) PbSlot {
+    const word_shift = comptime std.math.log2_int(usize, @sizeOf(Word));
+    return @truncate(ptr >> word_shift);
+}
 
 /// offset is in instructions, not bytes
 pub const Dest = packed struct { offset: i20, port: Port };
@@ -245,7 +278,7 @@ fn clock_token(state: *State, token: Token) void {
                     const minted = token.tag.offsetWith(data.payload.extract.d2);
                     state.push(.{
                         .tag = token.tag.offsetWith(data.d),
-                        .acc = @as(EffWord, @bitCast(minted)),
+                        .acc = @as(Word, @bitCast(minted)),
                     });
                 },
             }
@@ -259,9 +292,12 @@ fn clock_token(state: *State, token: Token) void {
             };
             const addr = slot.addr();
 
-            const other: MemValue = @bitCast(state.read(MemValue, addr));
+            const other: Word = @bitCast(state.read(Word, addr));
+            const pb_word_addr = pb_addr_for(addr);
+            var pb_word: PresenceBitWord = @bitCast(state.read(PresenceBitWord, pb_word_addr));
+            const pb = pb_word.get(pb_slot_for(addr));
             if (data.matching_rule != .Read) {
-                if (other.pb == .Empty) {
+                if (pb == .Empty) {
                     const new_pb: PresenceBits =
                         if (data.matching_rule == .Const and token.tag.port == .Right)
                             .Constant
@@ -269,37 +305,51 @@ fn clock_token(state: *State, token: Token) void {
                             .Empty
                         else
                             .Present;
-                    state.write(MemValue, addr, .{
-                        .pb = new_pb,
-                        .val = if (new_pb == .Empty) undefined else @truncate(token.acc),
-                    });
+                    state.write(
+                        Word,
+                        addr,
+                        if (new_pb == .Empty) undefined else token.acc,
+                    );
+                    pb_word.set(pb_slot_for(addr), new_pb);
+                    state.write(
+                        PresenceBitWord,
+                        pb_word_addr,
+                        pb_word,
+                    );
                     return;
-                } else if (other.pb == .Present) {
+                } else if (pb == .Present) {
                     const new_pb: PresenceBits =
                         if (data.matching_rule == .Const and token.tag.port == .Right)
                             .Constant
                         else
                             .Empty;
-                    state.write(MemValue, addr, .{
-                        .pb = new_pb,
-                        .val = if (new_pb == .Empty) undefined else @truncate(token.acc),
-                    });
-                } else if (other.pb == .Constant and data.matching_rule == .Const and token.tag.port == .Right) {
-                    state.write(MemValue, addr, .{
-                        .pb = .Constant,
-                        .val = @truncate(token.acc),
-                    });
+                    state.write(
+                        Word,
+                        addr,
+                        if (new_pb == .Empty) undefined else token.acc,
+                    );
+                    pb_word.set(pb_slot_for(addr), new_pb);
+                    state.write(
+                        PresenceBitWord,
+                        pb_word_addr,
+                        pb_word,
+                    );
+                } else if (pb == .Constant and data.matching_rule == .Const and token.tag.port == .Right) {
+                    state.write(
+                        Word,
+                        addr,
+                        token.acc,
+                    );
                 }
             }
 
-            const other_acc: Word = signExtend(other.val);
             const maybe_l, const maybe_r = apply_alu(
                 switch (data.forming_rule_tag) {
                     .Arith => data.forming_rule_payload.arith.alu_op,
                     else => .Nop,
                 },
-                if (token.tag.port == .Left) token.acc else other_acc,
-                if (token.tag.port == .Right) token.acc else other_acc,
+                if (token.tag.port == .Left) token.acc else other,
+                if (token.tag.port == .Right) token.acc else other,
             );
 
             switch (data.forming_rule_tag) {
