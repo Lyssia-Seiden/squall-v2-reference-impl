@@ -85,7 +85,7 @@ pub const PresenceBitsBacking = @typeInfo(PresenceBits).@"enum".tag_type;
 pub const PresenceBitWord = packed struct(Word) {
     repr: Word,
 
-    fn get(self: *const @This(), slot: PbSlot) PresenceBits {
+    pub fn get(self: *const @This(), slot: PbSlot) PresenceBits {
         const s = @as(std.math.Log2Int(Word), slot) * @bitSizeOf(PresenceBits);
         return @enumFromInt(@as(
             PresenceBitsBacking,
@@ -93,7 +93,7 @@ pub const PresenceBitWord = packed struct(Word) {
         ));
     }
 
-    fn set(self: *@This(), slot: PbSlot, pb: PresenceBits) void {
+    pub fn set(self: *@This(), slot: PbSlot, pb: PresenceBits) void {
         const s = @as(std.math.Log2Int(Word), slot) * @bitSizeOf(PresenceBits);
         self.repr = (self.repr & ~(@as(Word, std.math.maxInt(PresenceBitsBacking)) << s)) |
             (@as(Word, @intFromEnum(pb)) << s);
@@ -101,6 +101,7 @@ pub const PresenceBitWord = packed struct(Word) {
 };
 
 pub const PbSlot = std.math.Log2Int(@Int(.unsigned, @bitSizeOf(Word) / @bitSizeOf(PresenceBits)));
+pub const pb_group_words = 1 << @bitSizeOf(PbSlot);
 
 comptime {
     std.debug.assert(std.math.isPowerOfTwo(@bitSizeOf(PresenceBits)));

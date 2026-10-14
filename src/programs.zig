@@ -7,6 +7,7 @@ const fp_shift = @bitOffsetOf(sq.Tag, "fp");
 /// Frame slots of one `fib` activation. Every dyadic instruction that matches
 /// two tokens needs a slot of its own.
 const FibSlot = enum(u11) {
+    pb_word,
     pred,
     child_tag,
     arg1,
@@ -22,7 +23,7 @@ const FibSlot = enum(u11) {
 };
 
 const fib_stride_words: u11 = 16;
-const fib_sibling: u62 = @as(u62, fib_stride_words) << fp_shift;
+const fib_sibling: sq.Word = @as(sq.Word, fib_stride_words) << fp_shift;
 
 comptime {
     std.debug.assert(fib_stride_words >= @typeInfo(FibSlot).@"enum".fields.len);
@@ -181,8 +182,8 @@ const fib_entries = [_]a.Entry{
     .{ .label = "host_return", .value = .{ .write = .{
         .target = .{ .label = "result" },
     } } },
-    .{ .label = "result", .value = .{ .value = .{ .pb = .Empty, .val = 0 } } },
-    .{ .label = "sibling", .value = .{ .value = .{ .pb = .Constant, .val = fib_sibling } } },
+    .{ .label = "result", .value = .{ .value = .{ .val = 0 } } },
+    .{ .label = "sibling", .value = .{ .value = .{ .val = fib_sibling } } },
 };
 
 const ret_offset: a.Imm = .{ .label_delta = .{ .from = "entry_n", .to = "final_send" } };
@@ -226,6 +227,7 @@ pub const programs = [_]Program{
 pub const Error = error{
     UnknownProgram,
     FrameOverlapsStack,
+    FrameStrideSplitsPbGroup,
     FrameNotStrideAligned,
     RootFrameIndexTooLow,
     StackOverlapsImage,
@@ -247,7 +249,7 @@ fn entryTokens(p: Program, labels: a.LabelLookup) ![2]sq.Token {
     return .{
         .{
             .tag = .init(try .parse(try labelAddr(labels, p.ra)), fp, .Left),
-            .acc = @as(sq.EffWord, @bitCast(host)),
+            .acc = @as(sq.Word, @bitCast(host)),
         },
         .{
             .tag = .init(try .parse(try labelAddr(labels, p.arg)), fp, .Left),
@@ -257,11 +259,12 @@ fn entryTokens(p: Program, labels: a.LabelLookup) ![2]sq.Token {
 }
 
 fn imageEnd(p: Program) sq.SqPtr {
-    return a.image_base + @as(sq.SqPtr, @intCast(p.entries.len * @sizeOf(sq.Word)));
+    return a.entryAddr(p.entries.len);
 }
 
 fn checkLayout(p: Program) Error!void {
     const stride = @as(sq.SqPtr, p.frame_stride_words) * @sizeOf(sq.Word);
+    if (sq.pb_group_words % p.frame_stride_words != 0) return error.FrameStrideSplitsPbGroup;
     if (p.root_frame % stride != 0) return error.FrameNotStrideAligned;
     if (p.root_frame / stride < 1) return error.RootFrameIndexTooLow;
     if (p.stack_base + @sizeOf(sq.Token) > p.root_frame) return error.FrameOverlapsStack;

@@ -35,6 +35,7 @@ pub const AddrError = error{
     MisalignedTarget,
     OffsetOutOfRange,
     SecondTokenNotAdjacent,
+    MatchOnUntrackedSlot,
 };
 
 /// Distance from `here` to `there` in words, the unit every encoded offset uses.
@@ -167,12 +168,17 @@ pub const Write = struct {
     byte_enables: u8 = 0b11111111,
 };
 
+pub const Value = struct {
+    val: sq.Word,
+    pb: ?sq.PresenceBits = null,
+};
+
 pub const AsmField = union(enum) {
     monadic: Monadic,
     extract: Extract,
     dyadic: Dyadic,
     write: Write,
-    value: sq.Word,
+    value: Value,
 };
 pub const Entry = struct {
     label: Label,
@@ -242,14 +248,26 @@ fn value_to_word(
                 .byte_enables = data.byte_enables,
             } },
         }),
-        .value => |data| @bitCast(data),
+        .value => |data| data.val,
     };
 }
 
 pub const image_base: sq.SqPtr = 0x10;
 
-fn entryAddr(index: usize) sq.SqPtr {
-    return image_base + @as(sq.SqPtr, @intCast(index * @sizeOf(sq.Word)));
+const data_words_per_group = sq.pb_group_words - 1;
+
+/// Presence-bit words are never handed out, so the image is packed into the
+/// remaining words of each group.
+pub fn entryAddr(index: usize) sq.SqPtr {
+    const first = comptime blk: {
+        std.debug.assert(image_base % @sizeOf(sq.Word) == 0);
+        const w = image_base / @sizeOf(sq.Word);
+        std.debug.assert(w % sq.pb_group_words != 0);
+        break :blk (w / sq.pb_group_words) * data_words_per_group + w % sq.pb_group_words - 1;
+    };
+    const n = first + index;
+    const w = (n / data_words_per_group) * sq.pb_group_words + n % data_words_per_group + 1;
+    return @intCast(w * @sizeOf(sq.Word));
 }
 
 /// Addresses are fixed by position, so a full map is available before any
@@ -263,6 +281,29 @@ pub fn resolveLabels(allocator: std.mem.Allocator, entries: []const Entry) !Labe
         slot.value_ptr.* = entryAddr(i);
     }
     return labelLookup;
+}
+
+/// Only code slots are checked; frame and absolute slots are not known until
+/// run time.
+fn checkMatchTargets(entries: []const Entry) AddrError!void {
+    for (entries) |entry| {
+        const d = switch (entry.value) {
+            .dyadic => |d| d,
+            else => continue,
+        };
+        if (d.matching == .Read) continue;
+        const label = switch (d.slot) {
+            .code => |l| l,
+            else => continue,
+        };
+        const target = for (entries) |t| {
+            if (std.mem.eql(u8, t.label, label)) break t;
+        } else return error.NoAddrForLabel;
+        switch (target.value) {
+            .value => |v| if (v.pb == null) return error.MatchOnUntrackedSlot,
+            else => return error.MatchOnUntrackedSlot,
+        }
+    }
 }
 
 pub fn create_image(
@@ -281,9 +322,20 @@ pub fn create_image(
     var labelLookup = try resolveLabels(allocator, entries);
     defer labelLookup.deinit();
 
+    try checkMatchTargets(entries);
+
     for (entries, 0..) |entry, i| {
         const addr = entryAddr(i);
         state.write(sq.Word, addr, try value_to_word(entry.value, addr, labelLookup));
+        switch (entry.value) {
+            .value => |v| if (v.pb) |pb| {
+                const pb_addr = sq.pb_addr_for(addr);
+                var pb_word: sq.PresenceBitWord = @bitCast(state.read(sq.PresenceBitWord, pb_addr));
+                pb_word.set(sq.pb_slot_for(addr), pb);
+                state.write(sq.PresenceBitWord, pb_addr, pb_word);
+            },
+            else => {},
+        }
     }
 
     for (tokens) |token|
@@ -334,6 +386,58 @@ test "second token destinations must be the next instruction" {
             .second = .{ .label = "b" },
         } } },
         .{ .label = "b", .value = .{ .monadic = .{ .d = .halt } } },
+    }, &.{}, 0x1000);
+    state.memory.deinit();
+}
+
+test "entries skip presence-bit words" {
+    var addr = entryAddr(0);
+    for (1..4 * sq.pb_group_words) |i| {
+        const next = entryAddr(i);
+        try std.testing.expect(sq.pb_slot_for(next) != 0);
+        const gap: sq.SqPtr = if (sq.pb_slot_for(addr) == sq.pb_group_words - 1) 2 else 1;
+        try std.testing.expectEqual(addr + gap * @sizeOf(sq.Word), next);
+        addr = next;
+    }
+}
+
+test "value presence bits are loaded" {
+    var state = try create_image(std.testing.allocator, &.{
+        .{ .label = "a", .value = .{ .value = .{ .val = 7, .pb = .Constant } } },
+        .{ .label = "b", .value = .{ .value = .{ .val = 9, .pb = .Present } } },
+    }, &.{}, 0x1000);
+    defer state.memory.deinit();
+
+    for ([_]sq.PresenceBits{ .Constant, .Present }, 0..) |pb, i| {
+        const addr = entryAddr(i);
+        const pb_word: sq.PresenceBitWord = @bitCast(state.read(sq.PresenceBitWord, sq.pb_addr_for(addr)));
+        try std.testing.expectEqual(pb, pb_word.get(sq.pb_slot_for(addr)));
+    }
+}
+
+test "matching on a value without presence bits is rejected" {
+    const untracked: []const Entry = &.{
+        .{ .label = "m", .value = .{ .dyadic = .{
+            .slot = .{ .code = "v" },
+            .matching = .Once,
+            .form = .send,
+            .d = .halt,
+        } } },
+        .{ .label = "v", .value = .{ .value = .{ .val = 0 } } },
+    };
+    try std.testing.expectError(
+        error.MatchOnUntrackedSlot,
+        create_image(std.testing.allocator, untracked, &.{}, 0x1000),
+    );
+
+    var state = try create_image(std.testing.allocator, &.{
+        .{ .label = "m", .value = .{ .dyadic = .{
+            .slot = .{ .code = "v" },
+            .matching = .Read,
+            .form = .send,
+            .d = .halt,
+        } } },
+        .{ .label = "v", .value = .{ .value = .{ .val = 0 } } },
     }, &.{}, 0x1000);
     state.memory.deinit();
 }
