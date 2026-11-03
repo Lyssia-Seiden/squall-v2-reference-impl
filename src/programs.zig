@@ -1,6 +1,7 @@
 const std = @import("std");
 const sq = @import("root.zig");
 const a = @import("assembler.zig");
+const test_programs = @import("test_programs.zig");
 
 const fp_shift = @bitOffsetOf(sq.Tag, "fp");
 
@@ -205,6 +206,20 @@ pub const Program = struct {
     root_frame: sq.SqPtr,
     frame_stride_words: u11,
     max_cycles: usize,
+    /// Words the program writes as it runs, checked in addition to `result`.
+    checks: []const Check = &.{},
+    /// Hand-computed result for the default input, if known.
+    expected_result: ?sq.Word = null,
+    /// The program is built around its default input; ignore an input
+    /// given on the command line.
+    fixed_input: bool = false,
+};
+
+pub const Check = struct {
+    label: a.Label,
+    /// Hand-computed value for the default input; `null` means only the
+    /// model's own answer is known (random programs).
+    expected: ?sq.Word = null,
 };
 
 pub const programs = [_]Program{
@@ -277,8 +292,24 @@ fn maxDepth(p: Program) usize {
 const Trace = struct { cycles: usize, peak_stack: sq.SqPtr };
 
 fn run(state: *sq.State, max_cycles: usize) Trace {
+    return runTraced(state, max_cycles, null) catch unreachable;
+}
+
+/// One line per token popped: cycle, ip, fp, port, acc (hex). Tokens to ip 0
+/// are dropped without executing and are traced as such.
+fn runTraced(state: *sq.State, max_cycles: usize, out: ?*std.Io.Writer) !Trace {
     var trace: Trace = .{ .cycles = 0, .peak_stack = 0 };
     while (trace.cycles < max_cycles and !state.quiescent()) : (trace.cycles += 1) {
+        if (out) |w| {
+            const tok: sq.Token = @bitCast(state.read(sq.Token, state.stackTop + @sizeOf(sq.Token)));
+            try w.print("{d} {x} {x} {s} {x}\n", .{
+                trace.cycles,
+                tok.tag.ip.addr(),
+                tok.tag.fp.addr(),
+                if (tok.tag.port == .Left) "L" else "R",
+                tok.acc,
+            });
+        }
         sq.clock(state);
         const used = state.stackBase - state.stackTop;
         if (used > trace.peak_stack) trace.peak_stack = used;
@@ -291,18 +322,37 @@ fn readWord(state: *const sq.State, addr: sq.SqPtr) sq.Word {
 }
 
 /// A wrapped frame pointer, a token stack overrun or a stray `Write` all land in
-/// the image, so comparing it against the pristine copy catches them.
+/// the image, so comparing it against the pristine copy catches them. Words
+/// the program is meant to change (result, checks, matched code slots) and
+/// presence-bit words are skipped.
 fn checkImage(
     p: Program,
+    labels: a.LabelLookup,
     image: *const sq.State,
     sim: *const sq.State,
     result_addr: sq.SqPtr,
-) Error!void {
+) !void {
     var addr = a.image_base;
     while (addr < imageEnd(p)) : (addr += @sizeOf(sq.Word)) {
         if (addr == result_addr) continue;
+        if (sq.pb_slot_for(addr) == 0) continue;
+        if (mutable(p, labels, addr)) continue;
         if (readWord(image, addr) != readWord(sim, addr)) return error.ImageClobbered;
     }
+}
+
+fn mutable(p: Program, labels: a.LabelLookup, addr: sq.SqPtr) bool {
+    for (p.checks) |c| {
+        if (labels.get(c.label) == addr) return true;
+    }
+    for (p.entries) |e| {
+        if (labels.get(e.label) != addr) continue;
+        return switch (e.value) {
+            .value => |v| v.pb != null,
+            else => false,
+        };
+    }
+    return false;
 }
 
 fn memoryHex(gpa: std.mem.Allocator, state: *const sq.State) ![]u8 {
@@ -364,11 +414,13 @@ pub fn exportProgram(
     var sim = try a.create_image(gpa, p.entries, &tokens, p.stack_base);
     defer sim.memory.deinit();
 
-    const trace = run(&sim, p.max_cycles);
+    var trace_out: std.Io.Writer.Allocating = .init(gpa);
+    defer trace_out.deinit();
+    const trace = try runTraced(&sim, p.max_cycles, &trace_out.writer);
     if (p.stack_base - trace.peak_stack < imageEnd(p)) return error.TokenStackOverflow;
 
     const result_addr = try labelAddr(labels, p.result);
-    try checkImage(p, &image, &sim, result_addr);
+    try checkImage(p, labels, &image, &sim, result_addr);
     const report: Report = .{
         .cycles = trace.cycles,
         .peak_stack = trace.peak_stack,
@@ -425,6 +477,21 @@ pub fn exportProgram(
         report.high_addr,
     });
 
+    // Every word the testbench should compare after the run: each check,
+    // then the result. Same format as memory.hex.
+    var expected: std.Io.Writer.Allocating = .init(gpa);
+    defer expected.deinit();
+    if (p.checks.len > 0) try params.writer.print("num_checks = {d}\n", .{p.checks.len});
+    for (p.checks, 0..) |c, i| {
+        const addr = try labelAddr(labels, c.label);
+        try params.writer.print(
+            "check_{d} = {s} @0x{x} 0x{x}\n",
+            .{ i, c.label, addr / @sizeOf(sq.Word), readWord(&sim, addr) },
+        );
+        try expected.writer.print("@{x} {x}\n", .{ addr / @sizeOf(sq.Word), readWord(&sim, addr) });
+    }
+    try expected.writer.print("@{x} {x}\n", .{ result_addr / @sizeOf(sq.Word), report.result });
+
     const dir_path = try std.fs.path.join(gpa, &.{ out_root, p.name });
     defer gpa.free(dir_path);
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
@@ -432,6 +499,8 @@ pub fn exportProgram(
 
     try dir.writeFile(io, .{ .sub_path = "memory.hex", .data = memory });
     try dir.writeFile(io, .{ .sub_path = "params.txt", .data = params.written() });
+    try dir.writeFile(io, .{ .sub_path = "expected.hex", .data = expected.written() });
+    try dir.writeFile(io, .{ .sub_path = "trace.txt", .data = trace_out.written() });
 
     return report;
 }
@@ -440,9 +509,18 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const out_root = if (args.len > 1) args[1] else "out";
 
-    for (programs) |program| {
+    var all: std.ArrayList(Program) = .empty;
+    try all.appendSlice(init.arena.allocator(), &programs);
+    try all.appendSlice(init.arena.allocator(), try test_programs.all(init.arena.allocator()));
+
+    // optional third argument: only export programs whose name starts with it
+    const filter = if (args.len > 3) args[3] else "";
+
+    for (all.items) |program| {
+        if (!std.mem.startsWith(u8, program.name, filter)) continue;
         var p = program;
-        if (args.len > 2) p.input = try std.fmt.parseInt(sq.Word, args[2], 10);
+        if (args.len > 2 and !p.fixed_input and !std.mem.eql(u8, args[2], "-"))
+            p.input = try std.fmt.parseInt(sq.Word, args[2], 10);
 
         const report = try exportProgram(init.gpa, init.io, out_root, p);
         std.debug.print("{s}({d}) -> 0x{x} in {d} cycles{s}\n", .{
@@ -488,4 +566,63 @@ fn fibReference(n: usize) sq.Word {
         cur = next;
     }
     return cur;
+}
+
+test "test programs match their hand-computed expectations" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = std.testing.allocator;
+
+    for (try test_programs.all(arena_state.allocator())) |p| {
+        errdefer std.debug.print("in program {s}\n", .{p.name});
+        try checkLayout(p);
+        var labels = try a.resolveLabels(gpa, p.entries);
+        defer labels.deinit();
+
+        const tokens = try entryTokens(p, labels);
+        var image = try a.create_image(gpa, p.entries, &tokens, p.stack_base);
+        defer image.memory.deinit();
+        var sim = try a.create_image(gpa, p.entries, &tokens, p.stack_base);
+        defer sim.memory.deinit();
+
+        const trace = run(&sim, p.max_cycles);
+        try std.testing.expect(sim.quiescent());
+        try std.testing.expect(p.stack_base - trace.peak_stack >= imageEnd(p));
+        const result_addr = try labelAddr(labels, p.result);
+        try checkImage(p, labels, &image, &sim, result_addr);
+
+        for (p.checks) |c| {
+            const got = readWord(&sim, try labelAddr(labels, c.label));
+            errdefer std.debug.print("  check {s}: got 0x{x}\n", .{ c.label, got });
+            // every check word must actually have been written
+            try std.testing.expect(got != test_programs.sentinel);
+            if (c.expected) |e| try std.testing.expectEqual(e, got);
+        }
+        const result = readWord(&sim, result_addr);
+        try std.testing.expect(result != test_programs.sentinel);
+        if (p.expected_result) |e| try std.testing.expectEqual(e, result);
+    }
+}
+
+test "sum_loop for several inputs" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = std.testing.allocator;
+
+    const p0 = for (try test_programs.all(arena_state.allocator())) |p| {
+        if (std.mem.eql(u8, p.name, "sum_loop")) break p;
+    } else unreachable;
+
+    var labels = try a.resolveLabels(gpa, p0.entries);
+    defer labels.deinit();
+    for ([_]sq.Word{ 0, 1, 2, 7, 100 }) |n| {
+        var p = p0;
+        p.input = n;
+        const tokens = try entryTokens(p, labels);
+        var sim = try a.create_image(gpa, p.entries, &tokens, p.stack_base);
+        defer sim.memory.deinit();
+        _ = run(&sim, p.max_cycles);
+        try std.testing.expect(sim.quiescent());
+        try std.testing.expectEqual(n * (n + 1) / 2, readWord(&sim, try labelAddr(labels, p.result)));
+    }
 }
