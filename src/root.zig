@@ -50,9 +50,9 @@ test "sqptr align" {
 pub const Tag = packed struct(u62) {
     // 2^3 == 8 byte == word aligned
     ip: AlignedSqPtr(3),
+    pad: u3 = 0,
     fp: AlignedSqPtr(3),
     port: Port,
-    pad: u3 = 0,
 
     pub fn init(ip: AlignedSqPtr(3), fp: AlignedSqPtr(3), port: Port) Tag {
         return .{ .ip = ip, .fp = fp, .port = port };
@@ -77,8 +77,8 @@ pub fn signExtend(val: anytype) Word {
 }
 
 pub const Token = packed struct(u128) {
-    pad: u2 = 0,
     tag: Tag,
+    pad: u2 = 0,
     acc: Word,
 };
 
