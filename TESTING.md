@@ -35,8 +35,10 @@ All check writes are acked into the flow that produces `result`, so every check
 is written before the result is; stopping the sim on the result write is safe.
 
 The programs are schedule-independent: every matching slot sees its tokens in an
-order fixed by data dependencies, so RTL that schedules tokens differently from
-the model's LIFO stack must still produce the same words. (`trace.txt` order is
+order fixed by data dependencies, and every value that gets parked in a matching
+slot is first normalized to 62 bits (shl 2, shra 2), so RTL that schedules
+tokens differently from the model's LIFO stack must still produce the same
+words. (`trace.txt` order is
 the model's order; if the RTL schedules differently, compare traces sorted.)
 
 ## Programs
@@ -50,12 +52,25 @@ the model's order; if the RTL schedules differently, compare traces sorted.)
 | `matching` | frame-, code- and absolute-relative addressing; Once against a preloaded Present word (both ports); Read of untracked words; Const against a preloaded constant (repeated firing); a right token updating a Constant word and firing with the old value; a slot reused after a match clears it; an absolute `Write` read back frame-relatively |
 | `write_be` | byte enables (`FF 01 80 F0 0F 5A A5 00`), ack value, two acked writes merging into one word, write to a raw address read back with absolute addressing |
 | `call` | Extract minting tags, Send delivering to a minted tag (and to its own d), a call into a child frame at fp + 64 words returning through a passed return tag |
+| `mem62` | the 62-bit word format: presence bits in bits [63:62]; sign extension of memory reads (bit 61); Read ignoring and preserving presence bits; a `Write` setting Present/Constant through the top bits; byte enable `0x80` changing only the presence bits and `0x7F` keeping them; a Const update being cut to 62 bits; the minted tag layout `ip[28:0] pad[31:29] fp[60:32] port[61]` for both ports; Send dropping a tag's top two bits (a garbled tag must still land on the right port) |
 | `sum_loop` | a loop reusing its matching slots every iteration (result = n(n+1)/2; takes the command-line input) |
 | `rand_0001`…`rand_0008` | seeded random 48-step chains mixing monadic ops (random port, random/edge-case immediates, random second outputs), branches, and dyadic Reads of random 64-bit constants (code and absolute). Every step is a check word. Add seeds in `random_seeds` |
 
 Directed programs carry hand-computed expectations written with plain Zig
 arithmetic (not `apply_alu`), and `zig build test` checks the model against
 them. Random programs' expectations are the model's own output.
+
+## Checked against the model
+
+Besides hand-computed expectations, the suite was checked by breaking the model
+on purpose and confirming that a test fails:
+
+| change to the model | caught by |
+|---|---|
+| undo "adjust padding to match isacomp impl" | `mem62`, check `chk_ext_l` |
+| zero-extend memory reads instead of sign-extending | `alu_imm` and others |
+| Send keeps the wrong 62 bits of a tag | several programs |
+| Read consumes a Present word like Once | `matching` |
 
 ## Things the suite turned up about the model
 
@@ -72,10 +87,21 @@ These aren't failures, but the RTL needs an answer for each:
    each other. A loop whose next-iteration token can overtake the current one
    is schedule-dependent (`sum_loop` holds the counter until the new sum
    exists to avoid this).
-4. **Second output into a presence-bit word**: an instruction in the last slot
-   of a 32-word group has the next group's presence-bit word at `ip + 1`. The
-   assembler rejects this (`SecondTokenNotAdjacent`); the test builder pads or
-   hops around it automatically.
-5. **Matched words are written with `undefined`** when cleared, so frame memory
+4. **A parked token loses its top two bits.** When a token waits in a
+   matching slot, only its low 62 bits are stored, and its partner later sees
+   them sign-extended. So a dyadic op on any value whose bits 63..61 aren't all
+   equal gives a different answer depending on which operand arrives first.
+   This also applies to `final_send`: a result that doesn't fit in 62 bits,
+   arriving before the return tag, reaches the host cut to 62 bits. The suite
+   normalizes every parked value to avoid this; real programs would need a
+   compiler rule or a hardware answer.
+5. **A `Write` of an ordinary value sets presence bits.** Writing any value
+   with bit 63 or 62 set changes the word's presence state, so a negative
+   number written to a slot that is later matched on turns it Present or
+   Constant. Top bits `0b11` (any negative number) give a fourth state that
+   `PresenceBits` has no name for: the model's match code has no case for it,
+   and in Zig, turning those bits into the enum is illegal behaviour. The
+   spec should say what the hardware does.
+6. **Matched words are written with `undefined`** when cleared, so frame memory
    and matched code words aren't comparable between model and RTL. Only compare
    the words in `expected.hex`.

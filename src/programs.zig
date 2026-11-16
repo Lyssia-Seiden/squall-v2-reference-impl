@@ -323,8 +323,8 @@ fn readWord(state: *const sq.State, addr: sq.SqPtr) sq.Word {
 
 /// A wrapped frame pointer, a token stack overrun or a stray `Write` all land in
 /// the image, so comparing it against the pristine copy catches them. Words
-/// the program is meant to change (result, checks, matched code slots) and
-/// presence-bit words are skipped.
+/// the program is meant to change (result, checks, and code slots it
+/// matches on) are skipped.
 fn checkImage(
     p: Program,
     labels: a.LabelLookup,
@@ -335,7 +335,6 @@ fn checkImage(
     var addr = a.image_base;
     while (addr < imageEnd(p)) : (addr += @sizeOf(sq.Word)) {
         if (addr == result_addr) continue;
-        if (sq.pb_slot_for(addr) == 0) continue;
         if (mutable(p, labels, addr)) continue;
         if (readWord(image, addr) != readWord(sim, addr)) return error.ImageClobbered;
     }
@@ -345,12 +344,18 @@ fn mutable(p: Program, labels: a.LabelLookup, addr: sq.SqPtr) bool {
     for (p.checks) |c| {
         if (labels.get(c.label) == addr) return true;
     }
+    // code-relative slots that a non-Read dyadic instruction matches on
     for (p.entries) |e| {
-        if (labels.get(e.label) != addr) continue;
-        return switch (e.value) {
-            .value => |v| v.pb != null,
-            else => false,
+        const d = switch (e.value) {
+            .dyadic => |d| d,
+            else => continue,
         };
+        if (d.matching == .Read) continue;
+        const target = switch (d.slot) {
+            .code => |l| l,
+            else => continue,
+        };
+        if (labels.get(target) == addr) return true;
     }
     return false;
 }

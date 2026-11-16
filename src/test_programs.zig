@@ -33,13 +33,42 @@ const Label = a.Label;
 /// absolute reads) are known while the image is built.
 pub const root_frame: sq.SqPtr = 0x4000;
 const stack_base: sq.SqPtr = root_frame - @sizeOf(sq.Token);
-/// Stride covers one presence-bit group; only the call test uses a second frame.
+/// Only the call test uses a second frame.
 const frame_stride_words: u11 = 32;
 const fp_shift = @bitOffsetOf(sq.Tag, "fp");
 
 /// Written into every check word in the image so a check the RTL never
 /// wrote can't pass by accident.
 pub const sentinel: Word = 0xBAD0_BAD0_BAD0_BAD0;
+
+/// A memory word given as all 64 bits: presence bits in [63:62], value in
+/// [61:0]. Top bits 0b11 have no presence-bit meaning and are refused.
+pub fn raw(w: Word) sq.MemValue {
+    const pb: u2 = @truncate(w >> 62);
+    if (pb == 3) @panic("raw: presence bits 0b11 are not a valid state");
+    return .{ .val = @truncate(w), .pb = @enumFromInt(pb) };
+}
+
+/// A plain data word: value in the low 62 bits, presence bits Empty.
+pub fn data(v: u62) sq.MemValue {
+    return .{ .val = v, .pb = .Empty };
+}
+
+/// What a dyadic instruction sees when it reads `w` from memory: the low 62
+/// bits, sign-extended. Also what a token's value becomes if it is parked in
+/// a matching slot and its partner arrives later.
+pub fn seen(w: Word) Word {
+    return sq.signExtend(@as(u62, @truncate(w)));
+}
+
+/// True when parking `w` in a matching slot loses nothing.
+pub fn clean(w: Word) bool {
+    return seen(w) == w;
+}
+
+pub fn entryAddr(index: usize) sq.SqPtr {
+    return a.image_base + @as(sq.SqPtr, @intCast(index * @sizeOf(Word)));
+}
 
 fn sx(v: i32) Word {
     return @bitCast(@as(i64, v));
@@ -55,7 +84,7 @@ pub const Builder = struct {
     arena: std.mem.Allocator,
     entries: std.ArrayList(a.Entry) = .empty,
     checks: std.ArrayList(P.Check) = .empty,
-    next_frame_word: u11 = 1,
+    next_frame_word: u11 = 0,
 
     pub fn init(arena: std.mem.Allocator) Builder {
         return .{ .arena = arena };
@@ -65,55 +94,20 @@ pub const Builder = struct {
         return std.fmt.allocPrint(b.arena, fmt, args) catch @panic("OOM");
     }
 
-    /// Appends an entry. The word after the last slot of each 32-word group is
-    /// that next group's presence-bit word, so an instruction with a second
-    /// output must not sit in that last slot; a pad word is inserted to push
-    /// it into the next group.
     pub fn add(b: *Builder, label: Label, value: a.AsmField) void {
-        if (secondOf(value) != null and b.atGroupEnd()) {
-            if (b.entries.items.len > 0) {
-                if (secondOf(b.entries.items[b.entries.items.len - 1].value)) |prev| {
-                    if (std.mem.eql(u8, prev, label))
-                        std.debug.panic("chain of second outputs straddles a presence-bit word at {s}", .{label});
-                }
-            }
-            b.addRaw(b.lbl("pad{d}", .{b.entries.items.len}), .{ .value = .{ .val = 0 } });
-        }
-        b.addRaw(label, value);
-    }
-
-    fn addRaw(b: *Builder, label: Label, value: a.AsmField) void {
         b.entries.append(b.arena, .{ .label = label, .value = value }) catch @panic("OOM");
-    }
-
-    /// The next entry would be the last data word of its presence-bit group.
-    fn atGroupEnd(b: *const Builder) bool {
-        return sq.pb_slot_for(a.entryAddr(b.entries.items.len)) == sq.pb_group_words - 1;
-    }
-
-    fn secondOf(value: a.AsmField) ?Label {
-        return switch (value) {
-            .monadic => |m| if (m.second) |sec| sec.label else null,
-            .dyadic => |d| switch (d.form) {
-                .arith => |ar| if (ar.second) |sec| sec.label else null,
-                .send => null,
-            },
-            else => null,
-        };
     }
 
     /// Address `label` will have; only valid for entries already added.
     pub fn addrOf(b: *const Builder, label: Label) sq.SqPtr {
         for (b.entries.items, 0..) |e, i| {
-            if (std.mem.eql(u8, e.label, label)) return a.entryAddr(i);
+            if (std.mem.eql(u8, e.label, label)) return entryAddr(i);
         }
         @panic("addrOf: label not added yet");
     }
 
-    /// A fresh frame-relative slot, skipping the presence-bit word that
-    /// starts each 32-word group.
+    /// A fresh frame-relative slot.
     pub fn frame(b: *Builder) a.Slot {
-        if (b.next_frame_word % sq.pb_group_words == 0) b.next_frame_word += 1;
         defer b.next_frame_word += 1;
         return .{ .frame_words = b.next_frame_word };
     }
@@ -125,32 +119,35 @@ pub const Builder = struct {
         const w = b.lbl("w_{s}", .{name});
         const c = b.lbl("chk_{s}", .{name});
         b.add(w, .{ .write = .{ .target = .{ .label = c }, .ack = ack } });
-        b.add(c, .{ .value = .{ .val = sentinel } });
+        b.add(c, .{ .value = raw(sentinel) });
         b.checks.append(b.arena, .{ .label = c, .expected = expected }) catch @panic("OOM");
         return w;
     }
 
     /// A chain of `Dupl` instructions handing one copy of the incoming token
     /// to each of `dests`, each passing the token on to the next at `ip + 1`.
-    /// Where the chain reaches the end of a presence-bit group, a `Nop` hop
-    /// carries it over the presence-bit word. Returns the chain's entry label.
+    /// Returns the chain's entry label.
     pub fn fanout(b: *Builder, base: []const u8, dests: []const Ref) Label {
         std.debug.assert(dests.len > 0);
         for (dests, 0..) |d, i| {
             const last = i + 1 == dests.len;
-            var label = b.lbl("{s}_fan{d}", .{ base, i });
-            if (!last and b.atGroupEnd()) {
-                const cont = b.lbl("{s}_fan{d}_c", .{ base, i });
-                b.add(label, .{ .monadic = .{ .d = .l(cont) } });
-                label = cont;
-            }
-            b.add(label, .{ .monadic = .{
+            b.add(b.lbl("{s}_fan{d}", .{ base, i }), .{ .monadic = .{
                 .op = if (last) .Nop else .Dupl,
                 .d = d,
                 .second = if (last) null else .{ .label = b.lbl("{s}_fan{d}", .{ base, i + 1 }) },
             } });
         }
         return b.lbl("{s}_fan0", .{base});
+    }
+
+    /// `name`: shl 2, then `name_n`: shra 2, so the value leaving is the
+    /// 62-bit sign extension of the one arriving (see `seen`). Any value that
+    /// will be parked in a matching slot goes through this first; otherwise
+    /// what the partner sees depends on which token arrives first.
+    pub fn normalize(b: *Builder, name: Label, d: Ref) void {
+        const n2 = b.lbl("{s}_n", .{name});
+        b.add(name, .{ .monadic = .{ .op = .Shl, .imm = .{ .literal = 2 }, .d = .l(n2) } });
+        b.add(n2, .{ .monadic = .{ .op = .Shra, .imm = .{ .literal = 2 }, .d = d } });
     }
 
     /// The standard tail: the ra token and the final value meet at
@@ -163,7 +160,7 @@ pub const Builder = struct {
             .d = .halt,
         } });
         b.add("host_return", .{ .write = .{ .target = .{ .label = "result" } } });
-        b.add("result", .{ .value = .{ .val = sentinel } });
+        b.add("result", .{ .value = raw(sentinel) });
     }
 
     pub fn finish(
@@ -196,8 +193,9 @@ pub const Builder = struct {
 
 /// Collects `n` tokens into one with a chain of dyadic joins, one frame slot
 /// each. Input 0 enters join 1 on the left; input k enters join k on the
-/// right. Joins fire in a data-dependent order, so the chain is
-/// schedule-independent.
+/// right. Joins fire in a data-dependent order, and every input and every
+/// join output is normalized to 62 bits before it can be parked in a slot,
+/// so the chain is schedule-independent.
 const Joiner = struct {
     base: []const u8,
     n: usize,
@@ -210,30 +208,38 @@ const Joiner = struct {
 
     fn in(j: Joiner, b: *Builder, k: usize) Ref {
         std.debug.assert(k < j.n);
+        return .l(b.lbl("{s}_in{d}", .{ j.base, k }));
+    }
+
+    fn joinIn(j: Joiner, b: *Builder, k: usize) Ref {
         if (j.n == 1) return j.out;
         if (k == 0) return .l(j.name(b, 1));
         return .r(j.name(b, k));
     }
 
     fn emit(j: Joiner, b: *Builder) void {
+        for (0..j.n) |k| b.normalize(b.lbl("{s}_in{d}", .{ j.base, k }), j.joinIn(b, k));
         for (1..j.n) |k| {
+            const last = k + 1 == j.n;
+            const norm = b.lbl("{s}_out{d}", .{ j.base, k });
             b.add(j.name(b, k), .{ .dyadic = .{
                 .slot = b.frame(),
                 .matching = .Once,
                 .form = .{ .arith = .{ .op = j.op } },
-                .d = if (k + 1 == j.n) j.out else .l(j.name(b, k + 1)),
+                .d = .l(norm),
             } });
+            b.normalize(norm, if (last) j.out else .l(j.name(b, k + 1)));
         }
     }
 
     /// What the chain computes from its inputs, for the expected result.
     fn fold(j: Joiner, vals: []const Word) Word {
-        var acc = vals[0];
-        for (vals[1..]) |v| acc = switch (j.op) {
-            .Xor => acc ^ v,
-            .Add => acc +% v,
+        var acc = seen(vals[0]);
+        for (vals[1..]) |v| acc = seen(switch (j.op) {
+            .Xor => acc ^ seen(v),
+            .Add => acc +% seen(v),
             else => unreachable,
-        };
+        });
         return acc;
     }
 };
@@ -499,15 +505,38 @@ const dy_cases = [_]DyCase{
     .{ .name = "not2", .op = .Not, .r = .{ .op = .Rev }, .first = ~X, .second = ~X_REV },
     .{ .name = "beql_eq", .op = .Beql, .first = X, .branch = true },
     .{ .name = "beqr_ne", .op = .Beqr, .r = .{ .op = .Add, .imm = 1 }, .first = X +% 1, .branch = false },
-    .{ .name = "blel_gt", .op = .Blel, .r = .{ .op = .Shrl, .imm = 1 }, .first = X, .branch = true },
+    // (X >> 1 would not fit in 62 bits; X shra 1 = 0xF870... > X unsigned)
+    .{ .name = "blel_le", .op = .Blel, .r = .{ .op = .Shra, .imm = 1 }, .first = X, .branch = false },
+    .{ .name = "blel_gt", .op = .Blel, .l = .{ .op = .Shra, .imm = 1 }, .first = u(s(X) >> 1), .branch = true },
     .{ .name = "bler_eq", .op = .Bler, .first = X, .branch = false },
     .{ .name = "beqz_z", .op = .Beqz, .l = .{ .op = .And, .imm = 0 }, .r = .{ .op = .Rev }, .first = X_REV, .branch = true },
     .{ .name = "beqz_nz", .op = .Beqz, .r = .{ .op = .Rev }, .first = X_REV, .branch = false },
 };
 
+fn shapeVal(sh: Shape, v: Word) Word {
+    const imm = sx(sh.imm);
+    return switch (sh.op) {
+        .Nop => v,
+        .Shrl => v >> @truncate(imm),
+        .Shra => u(s(v) >> @truncate(imm)),
+        .And => v & imm,
+        .Add => v +% imm,
+        .Rev => @bitReverse(v),
+        else => @panic("shapeVal: op not modelled"),
+    };
+}
+
 fn dyadic(arena: std.mem.Allocator) P.Program {
     var b: Builder = .init(arena);
     const n = dy_cases.len;
+
+    // Whichever operand arrives first is parked in the slot and cut to 62
+    // bits, so an operand that doesn't fit would make the result depend on
+    // arrival order.
+    for (dy_cases) |c| {
+        if (!clean(shapeVal(c.l, X)) or !clean(shapeVal(c.r, X)))
+            std.debug.panic("alu_dyadic case {s}: operand does not fit in 62 bits", .{c.name});
+    }
 
     var n_checks: usize = 0;
     for (dy_cases) |c| n_checks += if (c.second != null) 2 else 1;
@@ -583,8 +612,8 @@ fn matching(arena: std.mem.Allocator) P.Program {
     const big: Word = 0x1_0000_0000;
 
     // Constants first so their absolute addresses are known.
-    b.add("k_big", .{ .value = .{ .val = big } });
-    b.add("k_three", .{ .value = .{ .val = 3 } });
+    b.add("k_big", .{ .value = data(big) });
+    b.add("k_three", .{ .value = data(3) });
     b.add("k_present_l", .{ .value = .{ .val = 50, .pb = .Present } });
     b.add("k_present_r", .{ .value = .{ .val = 50, .pb = .Present } });
     b.add("k_const", .{ .value = .{ .val = 7, .pb = .Constant } });
@@ -649,7 +678,8 @@ fn matching(arena: std.mem.Allocator) P.Program {
     vals[7] = 207;
     _ = b.probe("upd_second", 207, j.in(&b, 7)); // ip + 1 of upd_br
     _ = b.probe("upd_first", 107, .l("upd"));
-    b.checks.append(arena, .{ .label = "k_upd", .expected = 100 }) catch @panic("OOM");
+    // the whole word: Constant presence bits over the new value
+    b.checks.append(arena, .{ .label = "k_upd", .expected = (@as(Word, 2) << 62) | 100 }) catch @panic("OOM");
 
     // Absolute Write into the frame, then a frame-relative Read of it.
     vals[8] = x *% 2;
@@ -710,7 +740,7 @@ fn writeBe(arena: std.mem.Allocator) P.Program {
     for (bes, 0..) |be, i| {
         const tgt = b.lbl("be{d}_word", .{i});
         b.add(b.lbl("be{d}", .{i}), .{ .write = .{ .target = .{ .label = tgt }, .byte_enables = be, .ack = j.in(&b, i) } });
-        b.add(tgt, .{ .value = .{ .val = init_val } });
+        b.add(tgt, .{ .value = raw(init_val) });
         b.checks.append(arena, .{ .label = tgt, .expected = mergeBytes(init_val, x, be) }) catch @panic("OOM");
         vals[i] = x; // the ack carries the written value through
     }
@@ -720,17 +750,19 @@ fn writeBe(arena: std.mem.Allocator) P.Program {
     b.add("merge_lo", .{ .write = .{ .target = .{ .label = "merge_word" }, .byte_enables = 0x0F, .ack = .l("merge_not") } });
     b.add("merge_not", .{ .monadic = .{ .op = .Not, .d = .l("merge_hi") } });
     b.add("merge_hi", .{ .write = .{ .target = .{ .label = "merge_word" }, .byte_enables = 0xF0, .ack = j.in(&b, bes.len) } });
-    b.add("merge_word", .{ .value = .{ .val = init_val } });
+    b.add("merge_word", .{ .value = raw(init_val) });
     b.checks.append(arena, .{ .label = "merge_word", .expected = (x & 0xFFFF_FFFF) | (~x & 0xFFFF_FFFF_0000_0000) }) catch @panic("OOM");
     vals[bes.len] = ~x;
 
-    // Write to a raw address in the frame region, then read it back with
-    // absolute addressing.
-    const scratch: sq.SqPtr = root_frame + 0x100 + 8; // word 1 of the frame's second pb group
+    // Write all 64 bits to a raw address in the frame region, then read it
+    // back with absolute addressing. A Write stores the top two bits as
+    // presence bits, so the Read sees only the low 62 bits, sign-extended:
+    // x ^ seen(x) is exactly the lost top bits.
+    const scratch: sq.SqPtr = root_frame + 0x100 + 8;
     b.add("abs_write", .{ .write = .{ .target = .{ .addr = scratch }, .ack = .l("abs_read") } });
     b.add("abs_read", .{ .dyadic = .{ .slot = .{ .absolute_addr = scratch }, .matching = .Read, .form = .{ .arith = .{ .op = .Xor } }, .d = .l("w_abs_read") } });
-    _ = b.probe("abs_read", 0, j.in(&b, bes.len + 1));
-    vals[bes.len + 1] = 0;
+    _ = b.probe("abs_read", x ^ seen(x), j.in(&b, bes.len + 1));
+    vals[bes.len + 1] = x ^ seen(x);
 
     j.emit(&b);
     b.harness();
@@ -749,7 +781,7 @@ fn call(arena: std.mem.Allocator) P.Program {
     var b: Builder = .init(arena);
     const x: Word = 21;
 
-    b.add("k_child", .{ .value = .{ .val = child_offset_words << fp_shift } });
+    b.add("k_child", .{ .value = data(@intCast(child_offset_words << fp_shift)) });
 
     // the callee's result reaches the join through after_call
     const j: Joiner = .{ .base = "c", .n = 3, .out = .r("final_send"), .op = .Add };
@@ -803,6 +835,156 @@ fn call(arena: std.mem.Allocator) P.Program {
     j.emit(&b);
     b.harness();
     return b.finish("call", entry, x, j.fold(&vals), true, 1 << 16);
+}
+
+// ---------------------------------------------------------------------------
+// mem62: the word format from "revert moving pbs to addr%32" and the tag
+// layout from "adjust padding to match isacomp impl". Presence bits live in
+// bits [63:62] of every memory word and values are 62 bits, sign-extended
+// when a dyadic instruction reads them. Every case is ordered by data
+// dependencies, so none depends on token scheduling.
+// ---------------------------------------------------------------------------
+
+fn tagBits(ip: sq.SqPtr, fp: sq.SqPtr, port: sq.Port) Word {
+    // ip[28:0], pad[31:29], fp[60:32], port[61], all addresses in words
+    return @as(Word, ip >> 3) | (@as(Word, fp >> 3) << 32) | (@as(Word, @intFromEnum(port)) << 61);
+}
+
+fn mem62(arena: std.mem.Allocator) P.Program {
+    var b: Builder = .init(arena);
+    const x: Word = 21;
+    const cons: Word = 2 << 62;
+
+    b.add("k_sext", .{ .value = data(0x2000_0000_0000_0005) });
+    b.add("k_pres_neg1", .{ .value = .{ .val = std.math.maxInt(u62), .pb = .Present } });
+    b.add("k_w_pres", .{ .value = data(0) });
+    b.add("k_w_const", .{ .value = data(0) });
+    b.add("k_be_top", .{ .value = data(11) });
+    b.add("k_be_low", .{ .value = .{ .val = 1, .pb = .Present } });
+    b.add("k_cupd", .{ .value = .{ .val = 5, .pb = .Constant } });
+    b.add("k_garble", .{ .value = data(0x2000_0000_0000_0000) });
+
+    const n = 12;
+    const j: Joiner = .{ .base = "m62", .n = n, .out = .r("final_send"), .op = .Xor };
+    var vals: [n]Word = undefined;
+
+    const entry = b.fanout("x", &.{
+        .l("rd_sext"),
+        .l("rd_pres"),
+        .l("wp_mk"),
+        .l("wc_mk"),
+        .l("bt_mk"),
+        .l("bl_write"),
+        .l("cu_mk"),
+        .l("ext_l"),
+        .l("ext_r"),
+        .l("st_ext"),
+        .l("st_val"),
+    });
+
+    // Read sees the low 62 bits sign-extended: bit 61 set reads as negative.
+    vals[0] = 0xE000_0000_0000_0005;
+    b.add("rd_sext", .{ .dyadic = .{ .slot = .{ .code = "k_sext" }, .matching = .Read, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_rd_sext") } });
+    _ = b.probe("rd_sext", vals[0], j.in(&b, 0));
+
+    // Read of a Present word ignores the presence bits and leaves them
+    // alone; a later Once on the same word still fires with the value.
+    // val 0x3FFF...F reads as -1: x + -1, then (x - 1) - -1.
+    vals[1] = x - 1;
+    b.add("rd_pres", .{ .dyadic = .{ .slot = .{ .code = "k_pres_neg1" }, .matching = .Read, .form = .{ .arith = .{ .op = .Add } }, .d = .l("w_rd_pres") } });
+    _ = b.probe("rd_pres", vals[1], .l("rd_pres_fan"));
+    b.add("rd_pres_fan", .{ .monadic = .{ .op = .Dupl, .d = .l("once_pres"), .second = .{ .label = "rd_pres_fan2" } } });
+    b.add("rd_pres_fan2", .{ .monadic = .{ .d = j.in(&b, 1) } });
+    vals[2] = x;
+    b.add("once_pres", .{ .dyadic = .{ .slot = .{ .code = "k_pres_neg1" }, .matching = .Once, .form = .{ .arith = .{ .op = .Sub } }, .d = .l("w_once_pres") } });
+    _ = b.probe("once_pres", vals[2], j.in(&b, 2));
+
+    // A Write stores all 64 bits, so the top two become presence bits:
+    // writing (1 << 62) | 7 leaves a Present 7 for the acked token to match.
+    b.add("wp_mk", .{ .monadic = .{ .op = .Mul, .imm = .{ .literal = 0 }, .d = .l("wp_mk2") } });
+    b.add("wp_mk2", .{ .monadic = .{ .op = .Add, .imm = .{ .literal = 1 }, .d = .l("wp_mk3") } });
+    b.add("wp_mk3", .{ .monadic = .{ .op = .Shl, .imm = .{ .literal = 62 }, .d = .l("wp_mk4") } });
+    b.add("wp_mk4", .{ .monadic = .{ .op = .Or, .imm = .{ .literal = 7 }, .d = .l("wp_write") } });
+    b.add("wp_write", .{ .write = .{ .target = .{ .label = "k_w_pres" }, .ack = .l("wp_match") } });
+    vals[3] = 7;
+    b.add("wp_match", .{ .dyadic = .{ .slot = .{ .code = "k_w_pres" }, .matching = .Once, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_wp_match") } });
+    _ = b.probe("wp_match", vals[3], j.in(&b, 3));
+
+    // Writing (2 << 62) | 9 leaves a Constant 9; two left tokens both read it.
+    b.add("wc_mk", .{ .monadic = .{ .op = .Mul, .imm = .{ .literal = 0 }, .d = .l("wc_mk2") } });
+    b.add("wc_mk2", .{ .monadic = .{ .op = .Add, .imm = .{ .literal = 2 }, .d = .l("wc_mk3") } });
+    b.add("wc_mk3", .{ .monadic = .{ .op = .Shl, .imm = .{ .literal = 62 }, .d = .l("wc_mk4") } });
+    b.add("wc_mk4", .{ .monadic = .{ .op = .Or, .imm = .{ .literal = 9 }, .d = .l("wc_write") } });
+    b.add("wc_write", .{ .write = .{ .target = .{ .label = "k_w_const" }, .ack = .l("wc_fan") } });
+    b.add("wc_fan", .{ .monadic = .{ .op = .Dupl, .d = .l("wc_use0"), .second = .{ .label = "wc_fan2" } } });
+    b.add("wc_fan2", .{ .monadic = .{ .d = .l("wc_use1") } });
+    vals[4] = 9;
+    vals[5] = 9;
+    b.add("wc_use0", .{ .dyadic = .{ .slot = .{ .code = "k_w_const" }, .matching = .Const, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_wc_use0") } });
+    _ = b.probe("wc_use0", 9, j.in(&b, 4));
+    b.add("wc_use1", .{ .dyadic = .{ .slot = .{ .code = "k_w_const" }, .matching = .Const, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_wc_use1") } });
+    _ = b.probe("wc_use1", 9, j.in(&b, 5));
+    b.checks.append(arena, .{ .label = "k_w_const", .expected = cons | 9 }) catch @panic("OOM");
+
+    // Byte enable 0x80 writes only the top byte: 0x40 there sets Present
+    // and clears value bits [61:56], leaving the 11 underneath.
+    b.add("bt_mk", .{ .monadic = .{ .op = .Mul, .imm = .{ .literal = 0 }, .d = .l("bt_mk2") } });
+    b.add("bt_mk2", .{ .monadic = .{ .op = .Add, .imm = .{ .literal = 1 }, .d = .l("bt_mk3") } });
+    b.add("bt_mk3", .{ .monadic = .{ .op = .Shl, .imm = .{ .literal = 62 }, .d = .l("bt_write") } });
+    b.add("bt_write", .{ .write = .{ .target = .{ .label = "k_be_top" }, .byte_enables = 0x80, .ack = .l("bt_match") } });
+    vals[6] = 11;
+    b.add("bt_match", .{ .dyadic = .{ .slot = .{ .code = "k_be_top" }, .matching = .Once, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_bt_match") } });
+    _ = b.probe("bt_match", vals[6], j.in(&b, 6));
+
+    // Byte enables 0x7F leave the top byte, and so the presence bits, alone:
+    // the word stays Present with the new value 21.
+    b.add("bl_write", .{ .write = .{ .target = .{ .label = "k_be_low" }, .byte_enables = 0x7F, .ack = .l("bl_match") } });
+    vals[7] = x;
+    b.add("bl_match", .{ .dyadic = .{ .slot = .{ .code = "k_be_low" }, .matching = .Once, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_bl_match") } });
+    _ = b.probe("bl_match", vals[7], j.in(&b, 7));
+
+    // A right token updating a Constant is cut to 62 bits when stored. It
+    // fires with the old constant (5 - token), then a left token reads the
+    // new one: 0xC000...0010 is stored as 0x10.
+    const cu_tok: Word = 0xC000_0000_0000_0010;
+    b.add("cu_mk", .{ .monadic = .{ .op = .Mul, .imm = .{ .literal = 0 }, .d = .l("cu_mk2") } });
+    b.add("cu_mk2", .{ .monadic = .{ .op = .Add, .imm = .{ .literal = 3 }, .d = .l("cu_mk3") } });
+    b.add("cu_mk3", .{ .monadic = .{ .op = .Shl, .imm = .{ .literal = 62 }, .d = .l("cu_mk4") } });
+    b.add("cu_mk4", .{ .monadic = .{ .op = .Or, .imm = .{ .literal = 0x10 }, .d = .r("cu_upd") } });
+    b.add("cu_upd", .{ .dyadic = .{ .slot = .{ .code = "k_cupd" }, .matching = .Const, .form = .{ .arith = .{ .op = .Sub } }, .d = .l("w_cu_first") } });
+    vals[8] = 0x10;
+    _ = b.probe("cu_first", 5 -% cu_tok, .l("cu_read"));
+    b.add("cu_read", .{ .dyadic = .{ .slot = .{ .code = "k_cupd" }, .matching = .Const, .form = .{ .arith = .{ .op = .Dupr } }, .d = .l("w_cu_second") } });
+    _ = b.probe("cu_second", 0x10, j.in(&b, 8));
+    b.checks.append(arena, .{ .label = "k_cupd", .expected = cons | 0x10 }) catch @panic("OOM");
+
+    // Extract mints a 62-bit tag: ip[28:0], pad[31:29], fp[60:32], port[61].
+    // The mint target is k_sext; nothing is ever sent to it.
+    const k_sext = b.addrOf("k_sext");
+    vals[9] = tagBits(k_sext, root_frame, .Left);
+    vals[10] = tagBits(k_sext, root_frame, .Right);
+    b.add("ext_l", .{ .extract = .{ .mint = .l("k_sext"), .d = .l("w_ext_l") } });
+    _ = b.probe("ext_l", vals[9], j.in(&b, 9));
+    b.add("ext_r", .{ .extract = .{ .mint = .r("k_sext"), .d = .l("w_ext_r") } });
+    _ = b.probe("ext_r", vals[10], j.in(&b, 10));
+
+    // Send keeps only the low 62 bits of its tag. A Left tag for st_tgt is
+    // ORed with 0xE000... (k_garble read back), which sets the port bit and
+    // the two bits above it: the value must arrive at st_tgt's Right port
+    // (1000 - v), with the garbage dropped. The garbled tag fits in 62 bits,
+    // so parking it in the Send slot loses nothing.
+    const v: Word = x + 1;
+    b.add("st_ext", .{ .extract = .{ .mint = .l("st_tgt"), .d = .l("st_garble") } });
+    b.add("st_garble", .{ .dyadic = .{ .slot = .{ .code = "k_garble" }, .matching = .Read, .form = .{ .arith = .{ .op = .Or } }, .d = .l("st_send") } });
+    b.add("st_val", .{ .monadic = .{ .op = .Add, .imm = .{ .literal = 1 }, .d = .r("st_send") } });
+    b.add("st_send", .{ .dyadic = .{ .slot = b.frame(), .matching = .Once, .form = .send, .d = .halt } });
+    b.add("st_tgt", .{ .monadic = .{ .op = .Sub, .imm = .{ .literal = 1000 }, .d = .l("w_st_tgt") } });
+    vals[11] = 1000 - v;
+    _ = b.probe("st_tgt", vals[11], j.in(&b, 11));
+
+    j.emit(&b);
+    b.harness();
+    return b.finish("mem62", entry, x, j.fold(&vals), true, 1 << 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -879,7 +1061,8 @@ fn randomChain(arena: std.mem.Allocator, seed: u64, steps: usize) P.Program {
 
     for (0..steps) |i| {
         const here = b.lbl("s{d}", .{i});
-        const next: Ref = if (i + 1 == steps) .r("final_send") else .l(b.lbl("s{d}", .{i + 1}));
+        // the last value is parked at final_send, so it is normalized first
+        const next: Ref = if (i + 1 == steps) .l("tail_norm") else .l(b.lbl("s{d}", .{i + 1}));
         const w = b.lbl("w_s{d}", .{i});
         const port: sq.Port = if (r.boolean()) .Left else .Right;
 
@@ -898,8 +1081,15 @@ fn randomChain(arena: std.mem.Allocator, seed: u64, steps: usize) P.Program {
                     .second = if (with_second) .{ .label = b.lbl("w_s{d}_hi", .{i}) } else null,
                 } });
                 if (with_second) {
-                    _ = b.probe(b.lbl("s{d}_hi", .{i}), null, .r(sync));
-                    _ = b.probe(b.lbl("s{d}", .{i}), null, .l(sync));
+                    // Both values are parked at `sync`, so both are
+                    // normalized; the chain carries on with the 62-bit
+                    // value. The check words hold the full 64-bit outputs.
+                    const nh = b.lbl("s{d}_nh", .{i});
+                    const nl = b.lbl("s{d}_nl", .{i});
+                    _ = b.probe(b.lbl("s{d}_hi", .{i}), null, .l(nh));
+                    _ = b.probe(b.lbl("s{d}", .{i}), null, .l(nl));
+                    b.normalize(nh, .r(sync));
+                    b.normalize(nl, .l(sync));
                     // forward the main value once both are written
                     b.add(sync, .{ .dyadic = .{ .slot = b.frame(), .matching = .Once, .form = .{ .arith = .{ .op = .Dupl } }, .d = next } });
                 } else {
@@ -920,15 +1110,18 @@ fn randomChain(arena: std.mem.Allocator, seed: u64, steps: usize) P.Program {
                 b.add(b.lbl("s{d}_pl", .{i}), .{ .monadic = .{ .op = .Add, .imm = .{ .literal = r.int(i32) }, .d = .l(w) } });
                 _ = b.probe(b.lbl("s{d}", .{i}), null, next);
             },
-            // dyadic op against a random 64-bit constant, code or absolute
+            // dyadic op against a random 62-bit constant, code or absolute.
+            // The constant's presence bits are random too: Read must ignore
+            // them and see only the sign-extended 62-bit value.
             else => {
                 const op = arith_ops[r.uintLessThan(usize, arith_ops.len)];
-                var k = r.int(Word);
+                var k = r.int(u62);
                 if (op == .Div or op == .Rem or op == .Mod) {
-                    if (k == ~@as(Word, 0)) k = 3;
+                    if (k == std.math.maxInt(u62)) k = 3; // reads as -1
                 }
+                const pb: sq.PresenceBits = @enumFromInt(r.uintLessThan(u2, 3));
                 const kl = b.lbl("s{d}_k", .{i});
-                b.add(kl, .{ .value = .{ .val = k } });
+                b.add(kl, .{ .value = .{ .val = k, .pb = pb } });
                 const slot: a.Slot = if (r.boolean()) .{ .code = kl } else .{ .absolute_addr = b.addrOf(kl) };
                 b.add(here, .{ .dyadic = .{
                     .slot = slot,
@@ -941,6 +1134,7 @@ fn randomChain(arena: std.mem.Allocator, seed: u64, steps: usize) P.Program {
             },
         }
     }
+    b.normalize("tail_norm", .r("final_send"));
     b.harness();
     const name = b.lbl("rand_{x:0>4}", .{seed});
     return b.finish(name, "s0", r.int(Word), null, true, 1 << 16);
@@ -959,6 +1153,7 @@ pub fn all(arena: std.mem.Allocator) ![]const P.Program {
     try list.append(arena, matching(arena));
     try list.append(arena, writeBe(arena));
     try list.append(arena, call(arena));
+    try list.append(arena, mem62(arena));
     try list.append(arena, sumLoop(arena));
     for (random_seeds) |seed| try list.append(arena, randomChain(arena, seed, random_steps));
     return list.items;
